@@ -9,7 +9,7 @@ import { RNG } from './rng.js';
 import { Terrain } from './terrain.js';
 import { Tank } from './tank.js';
 import { Projectile, AirStrikeController, TeleportController, getWeaponSpec } from './weapons.js';
-import { tickAI } from './ai.js';
+import { tickAI, aiBuyInShop } from './ai.js';
 import { rgbToCx, alphaCx } from './renderer.js';
 
 export class TankGame {
@@ -66,6 +66,8 @@ export class TankGame {
     this.projectiles = [];
     this.airStrike = null;
     this.teleport = null;
+    this._aiPendingAirStrike = null;
+    this._aiPendingTeleport = null;
     this.blik = null; // { x, y, frame } Sprite 225 (35 frames)
 
     // Panel HUD interactive state
@@ -221,6 +223,8 @@ export class TankGame {
     this.projectiles = [];
     this.airStrike = null;
     this.teleport = null;
+    this._aiPendingAirStrike = null;
+    this._aiPendingTeleport = null;
     this.blik = null;
     this.shieldsMenuOpen = false;
     this.draggingPower = false;
@@ -330,6 +334,26 @@ export class TankGame {
 
   // ==================== ACTIONS (LOCAL + NETWORK SYNC) ====================
 
+  _canAct(fromRemote, fromAI) {
+    if (fromRemote) return true;
+    if (fromAI) return this.mode === 'local' || this.isHost;
+    return this.canLocalControl();
+  }
+
+  selectWeapon(gunIdx, fromRemote = false, fromAI = false) {
+    if (!this._canAct(fromRemote, fromAI)) return;
+    const t = this.activeTank;
+    if (!t) return;
+    if (gunIdx < 0 || gunIdx >= WEAPONS.length) return;
+    if (gunIdx !== 0 && t.data.guns[gunIdx] <= 0) return;
+    if (t.data.cur_gun === gunIdx) return;
+    t.data.cur_gun = gunIdx;
+    if (!fromAI) this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
+    if (!fromRemote && this.mode === 'online') {
+      this.cb.onOnlineAction?.({ type: 'weapon', gun: t.data.cur_gun });
+    }
+  }
+
   cycleWeapon(dir, fromRemote = false) {
     if (!fromRemote && !this.canLocalControl()) return;
     const t = this.activeTank;
@@ -350,8 +374,8 @@ export class TankGame {
     }
   }
 
-  useRepair(fromRemote = false) {
-    if (!fromRemote && !this.canLocalControl()) return;
+  useRepair(fromRemote = false, fromAI = false) {
+    if (!this._canAct(fromRemote, fromAI)) return;
     const t = this.activeTank;
     if (!t || t.data.specials[1] <= 0 || t.data.energy >= t.data.max_energy) return;
     t.data.energy = Math.min(t.data.max_energy, t.data.energy + 10);
@@ -362,27 +386,27 @@ export class TankGame {
     }
   }
 
-  toggleParachute(fromRemote = false) {
-    if (!fromRemote && !this.canLocalControl()) return;
+  toggleParachute(fromRemote = false, fromAI = false) {
+    if (!this._canAct(fromRemote, fromAI)) return;
     const t = this.activeTank;
     if (!t || t.data.specials[0] <= 0) return;
     t.par = !t.par;
-    this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
+    if (!fromAI) this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
     if (!fromRemote && this.mode === 'online') {
       this.cb.onOnlineAction?.({ type: 'parachute', enabled: t.par });
     }
   }
 
-  beginTeleport(fromRemote = false) {
-    if (!fromRemote && !this.canLocalControl()) return;
+  beginTeleport(fromRemote = false, fromAI = false) {
+    if (!this._canAct(fromRemote, fromAI)) return;
     const t = this.activeTank;
     if (!t || t.data.specials[7] <= 0) return;
     t.data.specials[7] -= 1;
     t.playing = false;
     this.teleport = new TeleportController(t);
-    this.teleport.cursorX = this.mouseX;
-    this.teleport.cursorY = this.mouseY;
-    this.cursorHidden = !fromRemote;
+    this.teleport.cursorX = fromAI ? t.x : this.mouseX;
+    this.teleport.cursorY = fromAI ? t.y : this.mouseY;
+    this.cursorHidden = !fromRemote && !fromAI;
     this.shieldsMenuOpen = false;
     if (!fromRemote && this.mode === 'online') {
       this.cb.onOnlineAction?.({ type: 'teleport_begin' });
@@ -398,8 +422,8 @@ export class TankGame {
     }
   }
 
-  activateShield(tier, fromRemote = false) {
-    if (!fromRemote && !this.canLocalControl()) return;
+  activateShield(tier, fromRemote = false, fromAI = false) {
+    if (!this._canAct(fromRemote, fromAI)) return;
     const t = this.activeTank;
     if (!t) return;
     if (t.activateShield(tier)) {
@@ -411,8 +435,8 @@ export class TankGame {
     }
   }
 
-  disableShield(fromRemote = false) {
-    if (!fromRemote && !this.canLocalControl()) return;
+  disableShield(fromRemote = false, fromAI = false) {
+    if (!this._canAct(fromRemote, fromAI)) return;
     const t = this.activeTank;
     if (!t || !t.shActive) return;
     t.disableShield();
@@ -662,12 +686,19 @@ export class TankGame {
     this.terrain.vitr = 0;
 
     if (this.mode === 'online') {
-      // Simultaneous shopping for local player's slot
+      // Simultaneous shopping for local player's slot; host executes AI shopping and syncs buys
       this.shopCur = this.mySlot;
       this.onlineReadySent = false;
       this.onlineReadyStatus = '';
+      if (this.isHost) {
+        for (let slot = 1; slot <= this.playerCount; slot++) {
+          if (this.playerData[slot - 1].type === 'ai') {
+            aiBuyInShop(slot, this);
+          }
+        }
+      }
     } else {
-      // Sequential shopping for human players (AI skipped, matching clona.next_player())
+      // Sequential shopping for humans; AI bots buy items with their earned cash
       this.shopCur = 0;
       this._shopNextPlayer();
     }
@@ -689,6 +720,8 @@ export class TankGame {
       if (this.playerData[this.shopCur - 1].type === 'tank') {
         return; // Human player's turn to shop
       }
+      // AI bot shops using its own earned score & exact shop prices
+      aiBuyInShop(this.shopCur, this);
     }
 
     // All players finished shopping -> open doors and start next round!
@@ -715,7 +748,7 @@ export class TankGame {
     return 'Start!';
   }
 
-  applyShopPurchase(slot, kind, index, fromRemote = false) {
+  applyShopPurchase(slot, kind, index, fromRemote = false, silent = false) {
     const pd = this.playerData[slot - 1];
     if (!pd) return false;
     if (kind === 'weapon') {
@@ -730,7 +763,7 @@ export class TankGame {
       pd.score -= s.price;
     }
     if (!fromRemote) {
-      this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
+      if (!silent) this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
       if (this.mode === 'online') {
         this.cb.onOnlineShopBuy?.({ slot, kind, index });
       }
@@ -775,12 +808,36 @@ export class TankGame {
       }
 
       // Active Air Strike controller
+      if (this._aiPendingAirStrike) {
+        if (!this.airStrike || this.airStrike.launched) {
+          this._aiPendingAirStrike = null;
+        } else {
+          this._aiPendingAirStrike.delay--;
+          if (this._aiPendingAirStrike.delay <= 0) {
+            const pending = this._aiPendingAirStrike;
+            this._aiPendingAirStrike = null;
+            this.launchAirStrike(pending.x, pending.uhel, false);
+          }
+        }
+      }
       if (this.airStrike) {
         this.airStrike.tick(this);
         if (this.airStrike.done) this.airStrike = null;
       }
 
       // Active Teleport controller
+      if (this._aiPendingTeleport) {
+        if (!this.teleport || this.teleport.picked) {
+          this._aiPendingTeleport = null;
+        } else {
+          this._aiPendingTeleport.delay--;
+          if (this._aiPendingTeleport.delay <= 0) {
+            const pending = this._aiPendingTeleport;
+            this._aiPendingTeleport = null;
+            this.confirmTeleport(pending.x, pending.y, false);
+          }
+        }
+      }
       if (this.teleport) {
         this.teleport.tick(this);
         if (this.teleport.done) this.teleport = null;
