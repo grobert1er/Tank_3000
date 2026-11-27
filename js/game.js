@@ -1,14 +1,15 @@
 // Master 25Hz Game Controller, Scene State Machine, Menus, HUD Panel & Shop
 
 import {
-  STAGE_W, STAGE_H, PANEL_X, PANEL_Y,
+  STAGE_W, STAGE_H, FPS, PANEL_X, PANEL_Y,
   PLAYER_COLORS, AI_DIFFICULTIES, WEAPONS, SPECIALS, SHIELD_TIERS, SOUNDS,
-  createInitialTankData,
+  MAX_UPGRADE_LEVEL, REPAIR_HEAL_AMOUNT, ROUND_BASE_STIPEND, ROUND_WIN_BONUS,
+  SUDDEN_DEATH_TURN, getMaxPower, createInitialTankData,
 } from './constants.js';
 import { RNG } from './rng.js';
 import { Terrain } from './terrain.js';
 import { Tank } from './tank.js';
-import { Projectile, AirStrikeController, TeleportController, getWeaponSpec } from './weapons.js';
+import { Projectile, AirStrikeController, TeleportController, spawnAirStrikeBombs, getWeaponSpec } from './weapons.js';
 import { tickAI, aiBuyInShop } from './ai.js';
 import { rgbToCx, alphaCx } from './renderer.js';
 
@@ -16,7 +17,7 @@ export class TankGame {
   constructor(renderer, sound, callbacks = {}) {
     this.renderer = renderer;
     this.sound = sound;
-    this.cb = callbacks; // { onOnlineAction, onOnlineAim, onOnlineShopBuy, onOnlineShopReady, onOnlineRoundOver, onStatusChange }
+    this.cb = callbacks; // { onOnlineAction, onOnlineAim, onOnlineShopBuy, onOnlineShopReady, onStatusChange, onAutoSave }
 
     this.rng = new RNG();
     this.aiRng = new RNG(Date.now() ^ 0x5a5a5a5a);
@@ -30,6 +31,15 @@ export class TankGame {
     this.onlineReadyStatus = ''; // e.g. 'Waiting (1/2)'
     this._pendingStateSync = null;
     this._pendingStateSyncWait = 0;
+
+    // Balance & anti-stall settings
+    this.balancePreset = 'balanced'; // 'balanced' | 'classic'
+    this.turnTimerSec = 0;           // 0 (Off) | 20 | 30
+    this.turnTicksLeft = 0;
+    this.roundTurns = 0;
+    this.pendingStrikes = [];
+    this.bannerToast = null; // { text, color, frames }
+    this._roundPayoutAwarded = false;
 
     // Scene state: 'menu1' | 'menu2' | 'loading' | 'battle' | 'round_end' | 'shop'
     this.scene = 'menu1';
@@ -127,10 +137,53 @@ export class TankGame {
     this.projectiles = [];
     this.airStrike = null;
     this.teleport = null;
+    this.pendingStrikes = [];
+    this.bannerToast = null;
+    this.roundTurns = 0;
+    this.turnTicksLeft = 0;
     this.blik = null;
     this.shieldsMenuOpen = false;
     this.cursorHidden = false;
     this._notifyStatus();
+  }
+
+  setBalancePreset(preset) {
+    this.balancePreset = preset === 'classic' ? 'classic' : 'balanced';
+  }
+
+  setTurnTimer(sec) {
+    const s = Number(sec) || 0;
+    this.turnTimerSec = [0, 20, 30].includes(s) ? s : 0;
+  }
+
+  showToast(text, color = '#ffe680', frames = 65) {
+    this.bannerToast = { text, color, frames };
+  }
+
+  // Sudden Death escalating damage multiplier to prevent endless rounds
+  getDamageMultiplier() {
+    const sdStart = this.balancePreset === 'classic' ? 20 : SUDDEN_DEATH_TURN;
+    if (this.roundTurns < sdStart) return 1;
+    const steps = Math.floor((this.roundTurns - sdStart) / 4);
+    return Math.min(3.0, 1.5 + steps * 0.5);
+  }
+
+  // True iff tankNumber is the sole #1 scoreboard leader with total_score > 0
+  isScoreLeader(tankNumber) {
+    if (!this.playerData || this.playerData.length < 2) return false;
+    let topScore = 0;
+    let topCount = 0;
+    let topNum = 0;
+    for (const pd of this.playerData) {
+      if (pd.total_score > topScore) {
+        topScore = pd.total_score;
+        topCount = 1;
+        topNum = pd.t_num;
+      } else if (pd.total_score === topScore && topScore > 0) {
+        topCount++;
+      }
+    }
+    return topScore > 0 && topCount === 1 && topNum === tankNumber;
   }
 
   _initMenu2() {
@@ -138,7 +191,9 @@ export class TankGame {
     this.randKrajina = this.krajinaSetting === 0;
     this.playerData = [];
     for (let i = 1; i <= this.playerCount; i++) {
-      this.playerData.push(createInitialTankData(i, '', PLAYER_COLORS[3], 'tank', 'normal'));
+      this.playerData.push(
+        createInitialTankData(i, '', PLAYER_COLORS[3], 'tank', 'normal', this.balancePreset)
+      );
     }
     this.gameRound = 0;
     this.setupCur = 1;
@@ -152,23 +207,40 @@ export class TankGame {
     this._notifyStatus();
   }
 
-  // Start an online multiplayer match from lobby config
-  startOnlineMatch({ seed, krajina, players, mySlot, isHost }) {
+  // Start an online multiplayer match from lobby config (or resume a saved match!)
+  startOnlineMatch({ seed, krajina, players, mySlot, isHost, preset, turnTimer, savedState }) {
     this.mode = 'online';
     this.mySlot = mySlot;
     this.isHost = Boolean(isHost);
+    if (preset) this.setBalancePreset(preset);
+    if (turnTimer !== undefined) this.setTurnTimer(turnTimer);
+
+    if (savedState) {
+      this.loadSaveData(savedState, {
+        mode: 'online',
+        mySlot,
+        isHost: Boolean(isHost),
+        slotOverrides: players,
+        turnTimerSec: turnTimer,
+      });
+      return;
+    }
+
     this.krajinaSetting = krajina;
     this.randKrajina = krajina === 0;
     this.playerCount = players.length;
     this.gameRound = 0;
     this.clona = null;
+    this.pendingStrikes = [];
+    this.bannerToast = null;
     this.playerData = players.map((p, idx) =>
       createInitialTankData(
         idx + 1,
         p.name || `Player ${idx + 1}`,
         p.col ?? PLAYER_COLORS[idx % PLAYER_COLORS.length],
         p.type || 'tank',
-        p.dif || 'normal'
+        p.dif || 'normal',
+        this.balancePreset
       )
     );
     this.rng.setSeed(seed);
@@ -204,10 +276,14 @@ export class TankGame {
   _prepareRoundData() {
     for (const pd of this.playerData) {
       pd.live = true;
-      pd.max_energy = 100 + pd.specials[8] * 10;
+      const energyLvl = Math.min(MAX_UPGRADE_LEVEL, pd.specials[8] || 0);
+      pd.max_energy = 100 + energyLvl * 10;
       pd.energy = pd.max_energy;
       pd.fuel = pd.specials[2];
     }
+    this.roundTurns = 0;
+    this.pendingStrikes = [];
+    this._roundPayoutAwarded = false;
     this.gameRound += 1;
   }
 
@@ -218,6 +294,7 @@ export class TankGame {
     this.projectiles = [];
     this.airStrike = null;
     this.teleport = null;
+    this.pendingStrikes = [];
     this.blik = null;
     this.shieldsMenuOpen = false;
     this.cursorHidden = false;
@@ -232,6 +309,7 @@ export class TankGame {
     this.projectiles = [];
     this.airStrike = null;
     this.teleport = null;
+    this.pendingStrikes = [];
     this._aiPendingAirStrike = null;
     this._aiPendingTeleport = null;
     this.blik = null;
@@ -244,25 +322,28 @@ export class TankGame {
     this.roundEndPending = false;
     this.roundTransitioning = false;
     this.roundEndTimer = 0;
+    this._roundPayoutAwarded = false;
+    this.roundTurns = 0;
+    this.turnTicksLeft = 0;
 
-    // Spawn each tank with minimum horizontal separation
-    const minSep = 350 / this.playerCount;
+    // Fairer spawns: stay well away from screen edges (x = 45..505)
+    const minSep = 320 / this.playerCount;
     for (let i = 0; i < this.playerCount; i++) {
       const pd = this.playerData[i];
-      let tx = this.rng.random(500) + 20;
+      let tx = this.rng.random(460) + 45;
       let guard = 0;
       while (this.terrain.topY(tx) > STAGE_H && guard++ < 500) {
-        tx = this.rng.random(500) + 20;
+        tx = this.rng.random(460) + 45;
       }
       let f = 0;
       let sepGuard = 0;
       while (f < i && sepGuard++ < 1500) {
         const otherX = this.tanks[f].x;
         if (tx < otherX + minSep && tx > otherX - minSep) {
-          tx = this.rng.random(500) + 20;
+          tx = this.rng.random(460) + 45;
           let g2 = 0;
           while (this.terrain.topY(tx) > STAGE_H && g2++ < 500) {
-            tx = this.rng.random(500) + 20;
+            tx = this.rng.random(460) + 45;
           }
           f = 0;
           continue;
@@ -273,9 +354,17 @@ export class TankGame {
       this.tanks.push(tank);
     }
 
-    // Sort round turn order strictly from lowest total_score to highest total_score
+    // Sort round turn order strictly from lowest total_score to highest total_score,
+    // breaking equal-score ties (like Round 1 at 0-0) via deterministic seeded roll
+    const tieRolls = new Map();
+    for (const tk of this.tanks) {
+      tieRolls.set(tk.tankNumber, this.rng.random(100000));
+    }
     this.turnOrder = [...this.tanks].sort(
-      (a, b) => a.data.total_score - b.data.total_score || a.tankNumber - b.tankNumber
+      (a, b) =>
+        a.data.total_score - b.data.total_score ||
+        (tieRolls.get(a.tankNumber) - tieRolls.get(b.tankNumber)) ||
+        a.tankNumber - b.tankNumber
     );
     this.turnIdx = 0;
     this.nextTank = this.turnOrder[0] || null;
@@ -285,6 +374,73 @@ export class TankGame {
     // Settle all tanks before starting the first turn
     this.triggerTest();
     this._notifyStatus();
+  }
+
+  // Anti-snowball round-end payouts: base stipend + survivor bonus + underdog catch-up cash
+  _awardRoundEndPayouts() {
+    if (this._roundPayoutAwarded) return;
+    this._roundPayoutAwarded = true;
+
+    const survivor = this.tanks.find((t) => t.data.live && t.data.energy > 0) || null;
+    // Rank players by total_score descending to determine underdog catch-up bonus
+    const ranked = [...this.playerData].sort(
+      (a, b) => b.total_score - a.total_score || a.t_num - b.t_num
+    );
+    const leaderScore = ranked[0]?.total_score ?? 0;
+
+    for (let i = 0; i < ranked.length; i++) {
+      const pd = ranked[i];
+      // Base round stipend so nobody is ever stuck broke
+      pd.score += ROUND_BASE_STIPEND;
+      // Underdog catch-up cash (shop budget only, doesn't inflate leaderboard score)
+      if (i > 0 && pd.total_score < leaderScore) {
+        pd.score += i * 1000;
+      }
+    }
+
+    if (survivor) {
+      survivor.data.score += ROUND_WIN_BONUS;
+      survivor.data.total_score += ROUND_WIN_BONUS;
+      this.showToast(
+        `${survivor.data.name} WINS! +$${ROUND_WIN_BONUS} · Round stipend +$${ROUND_BASE_STIPEND}`,
+        '#7ef29d',
+        75
+      );
+    } else {
+      this.showToast(`DRAW ROUND! Stipend +$${ROUND_BASE_STIPEND}`, '#ffe680', 70);
+    }
+  }
+
+  // Trigger any delayed Air Strike whose 1-turn warning has elapsed; returns true if bombs dropped
+  _processPendingStrikes() {
+    if (!this.pendingStrikes.length || !this.activeTank) return false;
+    const due = [];
+    const remaining = [];
+    for (const s of this.pendingStrikes) {
+      if (s.justPlanted) {
+        s.justPlanted = false;
+        remaining.push(s);
+      } else {
+        s.turnsLeft = (s.turnsLeft ?? 1) - 1;
+        if (s.turnsLeft <= 0) due.push(s);
+        else remaining.push(s);
+      }
+    }
+    this.pendingStrikes = remaining;
+    if (!due.length) return false;
+
+    for (const strike of due) {
+      if (this.mode === 'online' && this.isHost) {
+        this.cb.onOnlineAction?.({
+          type: 'strike_drop',
+          strike,
+          rngState: this.rng.getState(),
+        });
+      }
+      spawnAirStrikeBombs(this, strike);
+    }
+    this.showToast('AIR STRIKE IMPACT!', '#ff6b6b', 45);
+    return true;
   }
 
   // Trigger tank settling check
@@ -308,9 +464,18 @@ export class TankGame {
       this.activeTank = cand;
       this.nextTank = this.turnOrder[this.turnIdx % total];
       this.activeTank.playing = true;
-      if (this.activeTank.data.live) break;
+      if (this.activeTank.data.live && this.activeTank.data.energy > 0) break;
       this.activeTank.playing = false;
     }
+
+    const prevMult = this.getDamageMultiplier();
+    this.roundTurns += 1;
+    const newMult = this.getDamageMultiplier();
+    if (newMult > prevMult) {
+      this.showToast(`SUDDEN DEATH! ${newMult.toFixed(1)}× DAMAGE`, '#ff7b54', 70);
+    }
+
+    this.turnTicksLeft = this.turnTimerSec > 0 ? this.turnTimerSec * FPS : 0;
 
     if (this.aliveCount > 1 && this.activeTank && this.activeTank.data.live) {
       this.blik = { x: this.activeTank.x, y: this.activeTank.y - 10, frame: 0 };
@@ -320,6 +485,11 @@ export class TankGame {
     this.activeTank.onTurnStart();
     this.shieldsMenuOpen = false;
     this._notifyStatus();
+
+    // Auto-save cleanly at the start of every turn (Local or Online Host)
+    if (this.mode === 'local' || this.isHost) {
+      this.cb.onAutoSave?.(this.buildSaveData('Auto-Save'));
+    }
 
     // In online mode, host broadcasts an authoritative turn-start snapshot so all peers stay 100% synced
     if (this.mode === 'online' && this.isHost) {
@@ -395,7 +565,7 @@ export class TankGame {
     if (!this._canAct(fromRemote, fromAI)) return;
     const t = targetTank || this.activeTank;
     if (!t || (!fromRemote && (t.data.specials[1] <= 0 || t.data.energy >= t.data.max_energy))) return;
-    t.data.energy = Math.min(t.data.max_energy, t.data.energy + 10);
+    t.data.energy = Math.min(t.data.max_energy, Math.round(t.data.energy) + REPAIR_HEAL_AMOUNT);
     t.data.specials[1] = Math.max(0, t.data.specials[1] - 1);
     this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
     if (!fromRemote && this.mode === 'online') {
@@ -456,7 +626,7 @@ export class TankGame {
     const t = targetTank || this.activeTank;
     if (!t) return;
     if (fromRemote && t.shActive) t.disableShield();
-    if (t.activateShield(tier)) {
+    if (t.activateShield(tier, fromRemote)) {
       this.shieldsMenuOpen = false;
       this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
       if (!fromRemote && this.mode === 'online') {
@@ -547,6 +717,9 @@ export class TankGame {
     const ownerNum = this.airStrike.owner?.tankNumber || 0;
     if (uhel !== undefined) this.airStrike.uhel = uhel;
     this.airStrike.launch(this, targetX);
+    // Mark newest strike as justPlanted so it waits a full enemy turn before dropping
+    const last = this.pendingStrikes[this.pendingStrikes.length - 1];
+    if (last) last.justPlanted = true;
     this.cursorHidden = false;
     if (!fromRemote && this.mode === 'online') {
       this.cb.onOnlineAction?.({
@@ -584,6 +757,8 @@ export class TankGame {
     for (let i = 0; i < Math.min(arr.length, this.playerData.length); i++) {
       const src = arr[i];
       const dst = this.playerData[i];
+      if (src.name) dst.name = src.name;
+      if (src.col !== undefined) dst.col = src.col;
       dst.type = src.type;
       dst.dif = src.dif;
       dst.guns = src.guns.slice();
@@ -599,36 +774,246 @@ export class TankGame {
     }
   }
 
+  _serializeTanks() {
+    return this.tanks.map((t) => ({
+      tankNumber: t.tankNumber,
+      x: t.x,
+      y: t.y,
+      rotace: t.rotace,
+      power: t.power,
+      par: t.par,
+      shActive: t.shActive,
+      shieldUsedThisRound: t.shieldUsedThisRound,
+      shieldTier: t.shieldTier,
+      shieldEnergy: t.shieldEnergy,
+      shieldMax: t.shieldMax,
+      shieldSprite: t.shieldSprite,
+      dead: t.dead,
+      dying: t.dying,
+      playing: t.playing,
+      visible: t.visible,
+    }));
+  }
+
   buildSyncSnapshot() {
     return {
       round: this.gameRound,
       scene: this.scene,
+      krajinaSetting: this.krajinaSetting,
+      balancePreset: this.balancePreset,
+      turnTimerSec: this.turnTimerSec,
+      turnTicksLeft: this.turnTicksLeft,
+      roundTurns: this.roundTurns,
       vitr: this.terrain.vitr,
       rngState: this.rng.getState(),
       turnOrder: this.turnOrder.map((t) => t.tankNumber),
       turnIdx: this.turnIdx,
       activeSlot: this.activeTank ? this.activeTank.tankNumber : 0,
       aliveCount: this.aliveCount,
+      pendingStrikes: this.pendingStrikes.map((s) => ({ ...s })),
       terrain: this.scene === 'battle' ? this.terrain.serialize() : null,
       playerData: this._serializePlayerData(),
-      tanks: this.tanks.map((t) => ({
-        tankNumber: t.tankNumber,
-        x: t.x,
-        y: t.y,
-        rotace: t.rotace,
-        power: t.power,
-        par: t.par,
-        shActive: t.shActive,
-        shieldTier: t.shieldTier,
-        shieldEnergy: t.shieldEnergy,
-        shieldMax: t.shieldMax,
-        shieldSprite: t.shieldSprite,
-        dead: t.dead,
-        dying: t.dying,
-        playing: t.playing,
-        visible: t.visible,
-      })),
+      tanks: this._serializeTanks(),
     };
+  }
+
+  // ==================== MID-GAME SAVE & LOAD ====================
+
+  canSaveGame() {
+    if (this.scene !== 'battle' && this.scene !== 'shop') return false;
+    if (this.scene === 'battle' && (this._hasActiveBattleVisuals() || this.testing || this.roundEndPending)) {
+      return false;
+    }
+    return this.playerData.length >= 2;
+  }
+
+  buildSaveData(label = '') {
+    const names = this.playerData.map((p) => p.name).join(', ');
+    return {
+      version: 1,
+      id: `save-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      savedAt: Date.now(),
+      label: (label || '').trim() || `Round ${this.gameRound} · ${names}`,
+      mode: this.mode,
+      krajinaSetting: this.krajinaSetting,
+      balancePreset: this.balancePreset,
+      turnTimerSec: this.turnTimerSec,
+      turnTicksLeft: this.turnTicksLeft,
+      gameRound: this.gameRound,
+      roundTurns: this.roundTurns,
+      scene: this.scene === 'shop' ? 'shop' : 'battle',
+      shopCur: this.shopCur,
+      rngState: this.rng.getState(),
+      aiRngState: this.aiRng.getState(),
+      turnOrder: this.turnOrder.map((t) => t.tankNumber),
+      turnIdx: this.turnIdx,
+      activeSlot: this.activeTank ? this.activeTank.tankNumber : 0,
+      aliveCount: this.aliveCount,
+      pendingStrikes: this.pendingStrikes.map((s) => ({ ...s })),
+      terrain: this.scene === 'battle' ? this.terrain.serialize() : null,
+      playerData: this._serializePlayerData(),
+      tanks: this._serializeTanks(),
+    };
+  }
+
+  loadSaveData(save, opts = {}) {
+    if (!save || !Array.isArray(save.playerData) || save.playerData.length < 2) {
+      throw new Error('Invalid or corrupted save file.');
+    }
+
+    const mode = opts.mode || 'local';
+    this.mode = mode;
+    this.mySlot = mode === 'online' ? (opts.mySlot || 1) : 0;
+    this.isHost = mode === 'online' ? Boolean(opts.isHost) : true;
+    this.onlineReadySent = false;
+    this.onlineReadyStatus = '';
+    this._pendingStateSync = null;
+    this._pendingStateSyncWait = 0;
+
+    this.krajinaSetting = Number(save.krajinaSetting ?? 0);
+    this.randKrajina = this.krajinaSetting === 0;
+    this.setBalancePreset(save.balancePreset || 'balanced');
+    this.setTurnTimer(opts.turnTimerSec !== undefined ? opts.turnTimerSec : (save.turnTimerSec ?? 0));
+    this.gameRound = Math.max(1, Number(save.gameRound || 1));
+    this.roundTurns = Math.max(0, Number(save.roundTurns || 0));
+    this.turnTicksLeft = this.turnTimerSec > 0
+      ? Math.max(FPS * 3, Number(save.turnTicksLeft || this.turnTimerSec * FPS))
+      : 0;
+    this.playerCount = save.playerData.length;
+
+    if (save.rngState !== undefined) this.rng.setState(save.rngState);
+    if (save.aiRngState !== undefined) this.aiRng.setState(save.aiRngState);
+
+    // Rebuild playerData cleanly (applying any lobby slot overrides when resuming online)
+    const overrides = Array.isArray(opts.slotOverrides) ? opts.slotOverrides : null;
+    this.playerData = save.playerData.map((src, idx) => {
+      const ov = overrides?.[idx];
+      const base = createInitialTankData(
+        idx + 1,
+        ov?.name || src.name || `Player ${idx + 1}`,
+        ov?.col ?? src.col ?? PLAYER_COLORS[idx % PLAYER_COLORS.length],
+        ov?.type || src.type || 'tank',
+        ov?.dif || src.dif || 'normal',
+        this.balancePreset
+      );
+      base.guns = Array.isArray(src.guns) ? src.guns.slice(0, WEAPONS.length) : base.guns;
+      while (base.guns.length < WEAPONS.length) base.guns.push(0);
+      base.specials = Array.isArray(src.specials) ? src.specials.slice(0, SPECIALS.length) : base.specials;
+      while (base.specials.length < SPECIALS.length) base.specials.push(0);
+      base.cur_gun = Number(src.cur_gun || 0);
+      base.energy = Number(src.energy ?? base.energy);
+      base.max_energy = Number(src.max_energy ?? 100 + Math.min(MAX_UPGRADE_LEVEL, base.specials[8] || 0) * 10);
+      base.fuel = Number(src.fuel ?? base.specials[2]);
+      base.score = Math.max(0, Number(src.score ?? 0));
+      base.total_score = Math.max(0, Number(src.total_score ?? 0));
+      base.live = src.live !== false;
+      base.kills = Number(src.kills || 0);
+      return base;
+    });
+
+    this.projectiles = [];
+    this.airStrike = null;
+    this.teleport = null;
+    this._aiPendingAirStrike = null;
+    this._aiPendingTeleport = null;
+    this.blik = null;
+    this.shieldsMenuOpen = false;
+    this.draggingPower = false;
+    this.draggingAngle = false;
+    this.holdingFuelLeft = false;
+    this.holdingFuelRight = false;
+    this.testing = false;
+    this.shotFlying = false;
+    this.roundEndPending = false;
+    this.roundTransitioning = false;
+    this._roundPayoutAwarded = false;
+    this.cursorHidden = false;
+    this.pendingStrikes = Array.isArray(save.pendingStrikes)
+      ? save.pendingStrikes.map((s) => ({ ...s }))
+      : [];
+
+    if (save.scene === 'shop' || !save.terrain) {
+      this.tanks = [];
+      this.scene = 'shop';
+      this.clona = {
+        projizdi: false,
+        targetScene: 'shop',
+        purchasing: true,
+        openingAfterShop: false,
+        lx: -137.5,
+        rx: 137.0,
+        speed: 0,
+        k: 2340,
+        firstClosed: false,
+        swapped: false,
+      };
+      if (this.mode === 'online') {
+        this.shopCur = this.mySlot;
+      } else {
+        const savedCur = Math.max(1, Math.min(this.playerCount, Number(save.shopCur || 1)));
+        this.shopCur = savedCur;
+        if (this.playerData[this.shopCur - 1]?.type !== 'tank') {
+          this.shopCur = 0;
+          this._shopNextPlayer();
+        }
+      }
+      this.showToast(`Loaded Save (Round ${this.gameRound} Shop)`, '#7ef29d', 65);
+      this._notifyStatus();
+      return;
+    }
+
+    // Restore exact battle terrain & tanks
+    this.clona = null;
+    this.scene = 'battle';
+    this.terrain.deserialize(save.terrain);
+
+    this.tanks = this.playerData.map((pd, idx) => {
+      const s = save.tanks?.[idx];
+      const tk = new Tank(pd, s ? s.x : 80 + idx * 85, this.terrain, this.rng);
+      if (s) {
+        tk.x = s.x;
+        tk.y = s.y;
+        tk.rotace = s.rotace;
+        tk.power = s.power;
+        tk.par = Boolean(s.par);
+        tk.shActive = Boolean(s.shActive);
+        tk.shieldUsedThisRound = Boolean(s.shieldUsedThisRound);
+        tk.shieldTier = s.shieldTier || 0;
+        tk.shieldEnergy = s.shieldEnergy || 0;
+        tk.shieldMax = s.shieldMax || 0;
+        tk.shieldSprite = s.shieldSprite || null;
+        tk.dead = Boolean(s.dead);
+        tk.dying = Boolean(s.dying);
+        tk.playing = Boolean(s.playing);
+        tk.visible = s.visible !== false;
+        tk.testing = false;
+        tk.fall = 0;
+        tk.fallStartY = null;
+        tk.parOut = false;
+      }
+      return tk;
+    });
+
+    if (Array.isArray(save.turnOrder) && save.turnOrder.length) {
+      this.turnOrder = save.turnOrder.map((num) => this.tanks[num - 1]).filter(Boolean);
+    } else {
+      this.turnOrder = [...this.tanks];
+    }
+    this.turnIdx = Number(save.turnIdx || 0) % Math.max(1, this.turnOrder.length);
+    this.aliveCount = this.tanks.filter((t) => t.data.live && !t.dead).length;
+    this.activeTank = save.activeSlot > 0 ? (this.tanks[save.activeSlot - 1] || null) : null;
+    if (!this.activeTank || !this.activeTank.data.live) {
+      this.activeTank = this.tanks.find((t) => t.data.live && !t.dead) || null;
+    }
+    for (const tk of this.tanks) tk.playing = tk === this.activeTank;
+    if (this.activeTank) {
+      this.activeTank.firstFrame = true;
+      this.activeTank._aiTurnFrames = 0;
+      this.blik = { x: this.activeTank.x, y: this.activeTank.y - 10, frame: 0 };
+    }
+    this.nextTank = this.turnOrder.length ? this.turnOrder[this.turnIdx % this.turnOrder.length] : null;
+    this.showToast(`Loaded Save (Round ${this.gameRound})`, '#7ef29d', 65);
+    this._notifyStatus();
   }
 
   applyStateSync(snap) {
@@ -637,6 +1022,17 @@ export class TankGame {
     this._pendingStateSyncWait = 0;
 
     if (snap.round !== undefined) this.gameRound = snap.round;
+    if (snap.krajinaSetting !== undefined) {
+      this.krajinaSetting = snap.krajinaSetting;
+      this.randKrajina = this.krajinaSetting === 0;
+    }
+    if (snap.balancePreset) this.setBalancePreset(snap.balancePreset);
+    if (snap.turnTimerSec !== undefined) this.setTurnTimer(snap.turnTimerSec);
+    if (snap.turnTicksLeft !== undefined) this.turnTicksLeft = snap.turnTicksLeft;
+    if (snap.roundTurns !== undefined) this.roundTurns = snap.roundTurns;
+    if (Array.isArray(snap.pendingStrikes)) {
+      this.pendingStrikes = snap.pendingStrikes.map((s) => ({ ...s }));
+    }
     if (snap.rngState !== undefined) this.rng.setState(snap.rngState);
     if (snap.playerData) this._applySerializedPlayerData(snap.playerData);
 
@@ -658,7 +1054,6 @@ export class TankGame {
 
     if (snap.scene !== 'battle') return;
 
-    // Force-finish any residual loading curtain so state snaps cleanly into battle
     if (this.scene !== 'battle') {
       this.clona = null;
       this.scene = 'battle';
@@ -670,12 +1065,10 @@ export class TankGame {
       this.terrain.vitr = snap.vitr;
     }
 
-    // Ensure Tank objects exist (e.g. if guest rejoined straight into battle)
     if (this.tanks.length !== this.playerData.length) {
       this.tanks = this.playerData.map((pd, idx) => {
         const s = snap.tanks?.[idx];
-        const tk = new Tank(pd, s ? s.x : 100 + idx * 80, this.terrain, this.rng);
-        return tk;
+        return new Tank(pd, s ? s.x : 100 + idx * 80, this.terrain, this.rng);
       });
     }
 
@@ -693,6 +1086,7 @@ export class TankGame {
         tk.power = s.power;
         tk.par = s.par;
         tk.shActive = s.shActive;
+        tk.shieldUsedThisRound = Boolean(s.shieldUsedThisRound);
         tk.shieldTier = s.shieldTier;
         tk.shieldEnergy = s.shieldEnergy;
         tk.shieldMax = s.shieldMax;
@@ -703,6 +1097,7 @@ export class TankGame {
         tk.visible = s.visible !== false;
         tk.testing = false;
         tk.fall = 0;
+        tk.fallStartY = null;
         tk.parOut = false;
         tk.barrelFrame = 0;
         tk.barrelPlaying = false;
@@ -819,6 +1214,21 @@ export class TankGame {
 
     if (msg.type === 'shop_buy') {
       this.applyShopPurchase(msg.slot, msg.kind, msg.index, true);
+      return;
+    }
+
+    if (msg.type === 'strike_drop') {
+      this._catchUpForRemote(0);
+      if (this.scene === 'battle' && msg.strike) {
+        if (msg.rngState !== undefined) this.rng.setState(msg.rngState);
+        // Remove matching pending flare locally
+        const idx = this.pendingStrikes.findIndex(
+          (s) => s.targetX === msg.strike.targetX && s.ownerNum === msg.strike.ownerNum
+        );
+        if (idx >= 0) this.pendingStrikes.splice(idx, 1);
+        spawnAirStrikeBombs(this, msg.strike);
+        this.showToast('AIR STRIKE IMPACT!', '#ff6b6b', 45);
+      }
       return;
     }
 
@@ -961,6 +1371,7 @@ export class TankGame {
     this.projectiles = [];
     this.airStrike = null;
     this.teleport = null;
+    this.pendingStrikes = [];
     this.blik = null;
     this.terrain.vitr = 0;
 
@@ -975,11 +1386,15 @@ export class TankGame {
             aiBuyInShop(slot, this);
           }
         }
+        this.cb.onAutoSave?.(this.buildSaveData('Auto-Save (Shop)'));
       }
     } else {
       // Sequential shopping for humans; AI bots buy items with their earned cash
       this.shopCur = 0;
       this._shopNextPlayer();
+      if (this.scene === 'shop') {
+        this.cb.onAutoSave?.(this.buildSaveData('Auto-Save (Shop)'));
+      }
     }
     this._notifyStatus();
   }
@@ -1037,8 +1452,12 @@ export class TankGame {
       pd.score = Math.max(0, pd.score - w.price);
     } else {
       const s = SPECIALS[index];
-      if (!s || (!fromRemote && pd.score < s.price)) return false;
-      pd.specials[index] += s.pack;
+      if (!s) return false;
+      if (!fromRemote && s.maxLevel && pd.specials[index] >= s.maxLevel) return false;
+      if (!fromRemote && pd.score < s.price) return false;
+      pd.specials[index] = s.maxLevel
+        ? Math.min(s.maxLevel, pd.specials[index] + s.pack)
+        : pd.specials[index] + s.pack;
       pd.score = Math.max(0, pd.score - s.price);
     }
     if (!fromRemote) {
@@ -1191,6 +1610,39 @@ export class TankGame {
         }
       }
 
+      // Banner toast countdown
+      if (this.bannerToast) {
+        this.bannerToast.frames--;
+        if (this.bannerToast.frames <= 0) this.bannerToast = null;
+      }
+
+      // Pulse pending Air Strike flares
+      for (const s of this.pendingStrikes) {
+        s.pulse = ((s.pulse || 0) + 1) % 30;
+      }
+
+      // Optional Turn Timer countdown (auto-acts on timeout so rounds never stall)
+      if (
+        this.turnTimerSec > 0 &&
+        this.activeTank &&
+        this.activeTank.type === 'tank' &&
+        (this.activeTank.playing || (this.airStrike && !this.airStrike.launched) || (this.teleport && !this.teleport.picked))
+      ) {
+        if (this.turnTicksLeft > 0) {
+          this.turnTicksLeft--;
+        }
+        if (this.turnTicksLeft <= 0 && (this.canLocalControl() || this.canLocalControlSpecialOverlay())) {
+          if (this.airStrike && !this.airStrike.launched) {
+            this.launchAirStrike(this.airStrike.cursorX, this.airStrike.uhel);
+          } else if (this.teleport && !this.teleport.picked) {
+            this.confirmTeleport(this.teleport.cursorX, this.teleport.cursorY);
+          } else if (this.activeTank.playing) {
+            this.showToast(`${this.activeTank.data.name} time up! Auto-firing...`, '#ff9b6a', 45);
+            this.fireCurrentTank();
+          }
+        }
+      }
+
       // Apply deferred authoritative host state_sync once current explosion/death visuals finish
       if (this._pendingStateSync) {
         this._pendingStateSyncWait++;
@@ -1212,16 +1664,19 @@ export class TankGame {
         if (!anyTesting) {
           this.testing = false;
           if (this.aliveCount > 1) {
-            // In online mode, host advances turn authoritatively and broadcasts state_sync
+            // In online mode, host processes delayed Air Strikes & advances turn authoritatively
             if (this.mode !== 'online' || this.isHost) {
-              this.nextPlayer();
+              const droppedStrike = this._processPendingStrikes();
+              if (!droppedStrike) {
+                this.nextPlayer();
+              }
             }
           }
         }
       }
 
       // Check round end (< 2 tanks alive and everything settled)
-      // In online mode, host triggers open_shop authoritatively so peers never diverge
+      // In online mode, host awards round payouts and triggers open_shop authoritatively
       if (
         (this.mode !== 'online' || this.isHost) &&
         this.aliveCount < 2 &&
@@ -1234,6 +1689,7 @@ export class TankGame {
         !this.teleport &&
         !this.tanks.some((t) => t.dying)
       ) {
+        this._awardRoundEndPayouts();
         this.roundEndPending = true;
         this.roundEndTimer = 0;
       }
@@ -1393,7 +1849,7 @@ export class TankGame {
       // Power slider drag (panel (442.6, 28.4) + pow (-283.6, -25.9), sy = 0.44087)
       if (this.draggingPower) {
         const localY = (sy - (PANEL_Y - 25.9)) / 0.440872;
-        const maxPow = Math.min(100, t.data.energy);
+        const maxPow = getMaxPower(t.data.energy);
         const minY = Math.max(0, 100 - maxPow);
         const clampedY = Math.max(minY, Math.min(100, localY));
         t.power = Math.round(100 - clampedY);
@@ -1934,6 +2390,43 @@ export class TankGame {
       ctx.restore();
     }
 
+    // 5b. Pending Air Strike target flares (pulsing red danger zone)
+    if (this.pendingStrikes.length) {
+      for (const s of this.pendingStrikes) {
+        const pulse = 0.5 + 0.5 * Math.sin(((s.pulse || 0) / 30) * Math.PI * 2);
+        const groundY = Math.min(STAGE_H - 12, this.terrain.topY(s.targetX));
+        ctx.save();
+        // Translucent vertical laser danger zone
+        ctx.fillStyle = `rgba(255, 50, 50, ${0.12 + pulse * 0.16})`;
+        ctx.fillRect(s.targetX - 42, 54, 84, STAGE_H - 54);
+        // Dashed laser border lines
+        ctx.strokeStyle = `rgba(255, 85, 85, ${0.45 + pulse * 0.45})`;
+        ctx.lineWidth = 1.2;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(s.targetX - 42, 54);
+        ctx.lineTo(s.targetX - 42, STAGE_H);
+        ctx.moveTo(s.targetX + 42, 54);
+        ctx.lineTo(s.targetX + 42, STAGE_H);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // Ground flare beacon
+        ctx.beginPath();
+        ctx.arc(s.targetX, groundY - 3, 4 + pulse * 3, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 60, 40, ${0.65 + pulse * 0.35})`;
+        ctx.fill();
+        // Warning label
+        ctx.fillStyle = 'rgba(0,0,0,0.72)';
+        ctx.fillRect(s.targetX - 40, Math.max(60, groundY - 26), 80, 14);
+        ctx.fillStyle = '#ff7b7b';
+        ctx.font = 'bold 8.5px Arial, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('! AIR STRIKE !', s.targetX, Math.max(67, groundY - 19));
+        ctx.restore();
+      }
+    }
+
     // 6. Projectiles & Explosions
     for (const proj of this.projectiles) {
       proj.render(ctx, renderer);
@@ -2014,7 +2507,7 @@ export class TankGame {
         pow: {
           overrides: {
             pow: { y: 100 - t.power },
-            shadow: { y: -Math.min(100, pd.energy) },
+            shadow: { y: -getMaxPower(pd.energy) },
           },
         },
         '#145': {
@@ -2055,19 +2548,19 @@ export class TankGame {
           frame: shFrame,
           overrides: {
             sh1: {
-              frame: (pd.specials[3] > 0 && !t.shActive) ? (this.hoverShieldTier === 1 ? 1 : 0) : 2,
+              frame: (pd.specials[3] > 0 && !t.shActive && !t.shieldUsedThisRound) ? (this.hoverShieldTier === 1 ? 1 : 0) : 2,
               vars: { count: String(pd.specials[3]) },
             },
             sh2: {
-              frame: (pd.specials[4] > 0 && !t.shActive) ? (this.hoverShieldTier === 2 ? 1 : 0) : 2,
+              frame: (pd.specials[4] > 0 && !t.shActive && !t.shieldUsedThisRound) ? (this.hoverShieldTier === 2 ? 1 : 0) : 2,
               vars: { count: String(pd.specials[4]) },
             },
             sh3: {
-              frame: (pd.specials[5] > 0 && !t.shActive) ? (this.hoverShieldTier === 3 ? 1 : 0) : 2,
+              frame: (pd.specials[5] > 0 && !t.shActive && !t.shieldUsedThisRound) ? (this.hoverShieldTier === 3 ? 1 : 0) : 2,
               vars: { count: String(pd.specials[5]) },
             },
             sh4: {
-              frame: (pd.specials[6] > 0 && !t.shActive) ? (this.hoverShieldTier === 4 ? 1 : 0) : 2,
+              frame: (pd.specials[6] > 0 && !t.shActive && !t.shieldUsedThisRound) ? (this.hoverShieldTier === 4 ? 1 : 0) : 2,
               vars: { count: String(pd.specials[6]) },
             },
             sh_d: {
@@ -2095,20 +2588,68 @@ export class TankGame {
 
     ctx.restore();
 
-    // Subtle online turn banner when waiting on another player's turn
+    // Subtle battle status banners (Sudden Death, Turn Timer, Online Wait, Event Toast)
+    let bannerY = 53;
+    const dmgMult = this.getDamageMultiplier();
+    if (dmgMult > 1) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(130, 20, 10, 0.82)';
+      ctx.fillRect(8, bannerY, 138, 16);
+      ctx.strokeStyle = '#ff7b54';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(8, bannerY, 138, 16);
+      ctx.fillStyle = '#ffe0b2';
+      ctx.font = 'bold 9px Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`SUDDEN DEATH · ${dmgMult.toFixed(1)}x DMG`, 77, bannerY + 8);
+      ctx.restore();
+    }
+
+    if (this.turnTimerSec > 0 && this.activeTank && this.activeTank.type === 'tank' && this.activeTank.playing) {
+      const secs = Math.max(0, Math.ceil(this.turnTicksLeft / FPS));
+      const urgent = secs <= 5;
+      ctx.save();
+      ctx.fillStyle = urgent ? 'rgba(180, 24, 24, 0.86)' : 'rgba(0, 0, 0, 0.65)';
+      ctx.fillRect(390, 53, 56, 17);
+      ctx.fillStyle = urgent ? '#ffd54f' : '#e2ecff';
+      ctx.font = 'bold 10px Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`⏱ ${secs}s`, 418, 61.5);
+      ctx.restore();
+    }
+
     if (this.mode === 'online' && this.activeTank && this.activeTank.playing) {
       const isMine = this.activeTank.type === 'tank' && this.activeTank.tankNumber === this.mySlot;
       if (!isMine) {
         ctx.save();
         ctx.fillStyle = 'rgba(0,0,0,0.58)';
-        ctx.fillRect(175, 52, 200, 18);
+        ctx.fillRect(175, bannerY, 200, 18);
         ctx.fillStyle = '#ffe680';
         ctx.font = 'bold 10px Arial, sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(`Waiting for ${pd.name}...`, 275, 61);
+        ctx.fillText(`Waiting for ${pd.name}...`, 275, bannerY + 9);
         ctx.restore();
+        bannerY += 20;
       }
+    }
+
+    if (this.bannerToast) {
+      ctx.save();
+      ctx.font = 'bold 10px Arial, sans-serif';
+      const w = Math.min(360, Math.max(180, ctx.measureText(this.bannerToast.text).width + 24));
+      ctx.fillStyle = 'rgba(10, 14, 24, 0.78)';
+      ctx.fillRect(275 - w / 2, bannerY, w, 18);
+      ctx.strokeStyle = this.bannerToast.color;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(275 - w / 2, bannerY, w, 18);
+      ctx.fillStyle = this.bannerToast.color;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(this.bannerToast.text, 275, bannerY + 9);
+      ctx.restore();
     }
   }
 
@@ -2173,7 +2714,11 @@ export class TankGame {
       // Specials list (right column x = +140, y = -140 + 17.7*i)
       for (let i = 0; i < SPECIALS.length; i++) {
         const s = SPECIALS[i];
-        const afford = pd.score >= s.price;
+        const maxed = Boolean(s.maxLevel && pd.specials[i] >= s.maxLevel);
+        const afford = !maxed && pd.score >= s.price;
+        const countLabel = s.maxLevel
+          ? (maxed ? 'MAX' : `${pd.specials[i]}/${s.maxLevel}`)
+          : String(pd.specials[i]);
         const ry = -140 + 17.7 * i;
         ctx.save();
         ctx.translate(140, ry);
@@ -2181,9 +2726,9 @@ export class TankGame {
           vars: {
             w_caption: afford ? s.name : '',
             w2_caption: afford ? '' : s.name,
-            w_price: String(s.price),
+            w_price: maxed ? 'MAX' : String(s.price),
             w_count: String(s.pack),
-            t_count: String(pd.specials[i]),
+            t_count: countLabel,
           },
         });
         ctx.save();

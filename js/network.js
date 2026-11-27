@@ -461,6 +461,9 @@ export class NetworkClient {
       code,
       hostId: 'host',
       krajina: 0,
+      preset: 'balanced',
+      turnTimer: 0,
+      loadedSave: null,
       inMatch: false,
       roundNum: 0,
       readyIds: new Set(),
@@ -719,10 +722,21 @@ export class NetworkClient {
 
   _p2pSerializeLobby(viewerId) {
     const room = this._p2pRoom;
+    const saved = room.loadedSave;
     return {
       type: 'lobby_state',
       code: room.code,
       krajina: room.krajina,
+      preset: room.preset || 'balanced',
+      turnTimer: room.turnTimer || 0,
+      loadedSaveInfo: saved
+        ? {
+            label: saved.label || `Round ${saved.gameRound || 1}`,
+            round: saved.gameRound || 1,
+            scene: saved.scene || 'battle',
+            players: (saved.playerData || []).map((p) => ({ name: p.name, score: p.total_score || 0 })),
+          }
+        : null,
       inMatch: room.inMatch,
       isHost: viewerId === room.hostId,
       mySlot: this._p2pSlotOf(viewerId),
@@ -838,12 +852,26 @@ export class NetworkClient {
       const cleanName = String(msg.name || `Player ${room.slots.length + 1}`).trim().slice(0, 14) || 'Player';
       const sessId = String(msg.sessionId || cid);
       let placed = false;
-      if (room.slots.length < 5) {
+      // When resuming a saved match, claim saved human slots first before adding new slots
+      if (room.loadedSave) {
+        for (const s of room.slots) {
+          if (s.kind === 'ai' && s.wantHuman) {
+            s.kind = 'human';
+            s.clientId = cid;
+            s.sessionId = sessId;
+            s.name = cleanName;
+            s.wantHuman = false;
+            placed = true;
+            break;
+          }
+        }
+      }
+      if (!placed && !room.loadedSave && room.slots.length < 5) {
         const used = new Set(room.slots.map((s) => s.col));
         const pickCol = PLAYER_COLORS.find((c) => !used.has(c)) ?? PLAYER_COLORS[room.slots.length % PLAYER_COLORS.length];
         room.slots.push({ kind: 'human', clientId: cid, sessionId: sessId, name: cleanName, col: pickCol, dif: 'normal' });
         placed = true;
-      } else {
+      } else if (!placed) {
         for (const s of room.slots) {
           if (s.kind === 'ai') {
             s.kind = 'human';
@@ -889,7 +917,50 @@ export class NetworkClient {
       if (action === 'set_krajina') {
         const k = Number(msg.krajina ?? 0);
         if ([0, 1, 2, 3].includes(k)) room.krajina = k;
-      } else if (action === 'add_bot' && room.slots.length < 5) {
+      } else if (action === 'set_preset') {
+        room.preset = msg.preset === 'classic' ? 'classic' : 'balanced';
+      } else if (action === 'set_turn_timer') {
+        const sec = Number(msg.turnTimer ?? 0);
+        if ([0, 20, 30].includes(sec)) room.turnTimer = sec;
+      } else if (action === 'set_loaded_save') {
+        const save = msg.save;
+        if (save && Array.isArray(save.playerData) && save.playerData.length >= 2 && save.playerData.length <= 5) {
+          const connectedHumans = room.slots.filter((s) => s.kind === 'human');
+          const newSlots = save.playerData.map((pd) => ({
+            kind: 'ai',
+            clientId: null,
+            sessionId: null,
+            name: pd.name || 'Player',
+            col: pd.col ?? PLAYER_COLORS[0],
+            dif: pd.dif || 'normal',
+            wantHuman: pd.type === 'tank',
+          }));
+          // Place connected humans into saved human slots first, then any remaining slots
+          const placedIndices = new Set();
+          for (const h of connectedHumans) {
+            let targetIdx = newSlots.findIndex((s, i) => !placedIndices.has(i) && s.wantHuman);
+            if (targetIdx < 0) targetIdx = newSlots.findIndex((_, i) => !placedIndices.has(i));
+            if (targetIdx >= 0) {
+              placedIndices.add(targetIdx);
+              newSlots[targetIdx] = {
+                ...newSlots[targetIdx],
+                kind: 'human',
+                clientId: h.clientId,
+                sessionId: h.sessionId,
+                wantHuman: false,
+              };
+            }
+          }
+          room.slots = newSlots;
+          room.loadedSave = save;
+          room.krajina = Number(save.krajinaSetting ?? 0);
+          room.preset = save.balancePreset === 'classic' ? 'classic' : 'balanced';
+          room.turnTimer = [0, 20, 30].includes(Number(save.turnTimerSec)) ? Number(save.turnTimerSec) : 0;
+        }
+      } else if (action === 'clear_loaded_save') {
+        room.loadedSave = null;
+        for (const s of room.slots) delete s.wantHuman;
+      } else if (action === 'add_bot' && !room.loadedSave && room.slots.length < 5) {
         const used = new Set(room.slots.map((s) => s.col));
         const pickCol = PLAYER_COLORS.find((c) => !used.has(c)) ?? PLAYER_COLORS[room.slots.length % PLAYER_COLORS.length];
         room.slots.push({
@@ -900,7 +971,7 @@ export class NetworkClient {
           col: pickCol,
           dif: 'normal',
         });
-      } else if (action === 'remove_slot') {
+      } else if (action === 'remove_slot' && !room.loadedSave) {
         const idx = Number(msg.index ?? -1);
         const slot = room.slots[idx];
         const canRemove =
@@ -940,7 +1011,9 @@ export class NetworkClient {
         return;
       }
       room.inMatch = true;
-      room.roundNum = 1;
+      const savedState = room.loadedSave || null;
+      room.roundNum = savedState ? Math.max(1, Number(savedState.gameRound || 1)) : 1;
+      room.loadedSave = null;
       room.readyIds.clear();
       const seed = randomSeed();
       const players = room.slots.map((s) => ({
@@ -956,6 +1029,9 @@ export class NetworkClient {
           code: room.code,
           seed,
           krajina: room.krajina,
+          preset: room.preset || 'balanced',
+          turnTimer: room.turnTimer || 0,
+          savedState,
           players,
           mySlot: this._p2pSlotOf(viewerId),
           isHost: viewerId === 'host',

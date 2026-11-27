@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Tanks — Tank 3000</title>
-  <link rel="stylesheet" href="css/style.css?v=9">
+  <link rel="stylesheet" href="css/style.css?v=10">
 </head>
 <body>
   <div id="app">
@@ -15,6 +15,18 @@
         <button id="btn-away-bot" class="bar-btn warn" type="button" hidden title="Replace away player with an AI bot"></button>
       </div>
       <div class="bar-right">
+        <div id="local-rules-bar" class="rules-inline" title="Local match rules & turn timer">
+          <select id="local-preset" class="bar-select" aria-label="Balance preset">
+            <option value="balanced" selected>Balanced</option>
+            <option value="classic">Classic / Chaos</option>
+          </select>
+          <select id="local-timer" class="bar-select" aria-label="Turn timer">
+            <option value="0" selected>Timer: Off</option>
+            <option value="20">Timer: 20s</option>
+            <option value="30">Timer: 30s</option>
+          </select>
+        </div>
+        <button id="btn-saves" class="bar-btn" type="button" title="Save or Resume a Mid-Game Match">💾 Saves</button>
         <button id="btn-local" class="bar-btn" type="button" title="Return to Local Title Screen">Local Game</button>
         <button id="btn-online" class="bar-btn accent" type="button" title="Play Online / LAN Multiplayer">Online Lobby</button>
         <button id="btn-controls" class="bar-btn" type="button">Controls</button>
@@ -67,7 +79,18 @@
             <span class="room-label">ROOM CODE</span>
             <span id="room-code-display" class="room-code">----</span>
           </div>
-          <button id="btn-copy-invite" type="button" class="secondary-btn small">Copy Invite Link</button>
+          <div class="room-header-actions">
+            <button id="btn-lobby-load-save" type="button" class="secondary-btn small" title="Resume a saved match with this room">💾 Load Save</button>
+            <button id="btn-copy-invite" type="button" class="secondary-btn small">Copy Invite Link</button>
+          </div>
+        </div>
+
+        <div id="lobby-save-banner" class="save-banner" hidden>
+          <div class="save-banner-text">
+            <strong id="lobby-save-title">Loaded Save</strong>
+            <span id="lobby-save-sub"></span>
+          </div>
+          <button id="btn-clear-lobby-save" type="button" class="btn-mini" title="Clear loaded save">&times;</button>
         </div>
 
         <div class="room-settings">
@@ -81,12 +104,53 @@
           <button id="btn-add-bot" type="button" class="secondary-btn small">+ Add Bot</button>
         </div>
 
+        <div class="room-settings">
+          <label for="room-preset">Rules:</label>
+          <select id="room-preset">
+            <option value="balanced">Balanced</option>
+            <option value="classic">Classic / Chaos</option>
+          </select>
+          <label for="room-timer">Timer:</label>
+          <select id="room-timer">
+            <option value="0">Off</option>
+            <option value="20">20s</option>
+            <option value="30">30s</option>
+          </select>
+        </div>
+
         <div id="room-slots" class="slots-list"></div>
 
         <div class="room-footer">
           <button id="btn-leave-room" type="button" class="secondary-btn">Leave Room</button>
           <button id="btn-start-online" type="button" class="primary-btn">Start Match</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mid-Game Save / Load Modal -->
+  <div id="saves-modal" class="modal-backdrop" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>Mid-Game Saves</h2>
+        <button type="button" class="close-btn" data-close-modal>&times;</button>
+      </div>
+      <div id="saves-status" class="info-banner" hidden></div>
+
+      <div id="save-now-section" class="save-now-box">
+        <div class="save-now-row">
+          <input id="save-name-input" type="text" maxlength="40" placeholder="Optional save name (e.g. Round 5 comeback)">
+          <button id="btn-save-now" type="button" class="primary-btn">Save Now</button>
+        </div>
+        <p id="save-now-hint" class="hint">Auto-save runs automatically every turn and at the Shop. You can also save snapshots manually or export a .json file.</p>
+      </div>
+
+      <div id="saves-list" class="saves-list"></div>
+
+      <div class="saves-footer">
+        <input id="import-save-file" type="file" accept=".json,application/json" hidden>
+        <button id="btn-import-save" type="button" class="secondary-btn small">Import .json File</button>
+        <button type="button" class="secondary-btn small" data-close-modal>Close</button>
       </div>
     </div>
   </div>
@@ -104,12 +168,12 @@
         <tr><td><kbd>PgUp</kbd> / <kbd>PgDn</kbd> or <kbd>W</kbd> / <kbd>S</kbd></td><td>Adjust fire power (or drag HUD bar)</td></tr>
         <tr><td><kbd>Q</kbd> / <kbd>E</kbd></td><td>Cycle weapons (or click HUD arrows)</td></tr>
         <tr><td><kbd>Space</kbd></td><td>Fire weapon (or click HUD Fire button)</td></tr>
-        <tr><td>Mouse HUD</td><td>Repair, Parachutes, Teleport, Shields flyout, Shop</td></tr>
+        <tr><td>Mouse HUD</td><td>Repair (+15 HP), Parachutes, Teleport, Shields (1/round), Shop</td></tr>
       </table>
     </div>
   </div>
 
-  <script src="js/vendor/peerjs.min.js?v=9"></script>
-  <script type="module" src="js/main.js?v=9"></script>
+  <script src="js/vendor/peerjs.min.js?v=10"></script>
+  <script type="module" src="js/main.js?v=10"></script>
 </body>
 </html>

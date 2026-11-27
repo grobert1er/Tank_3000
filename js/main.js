@@ -19,15 +19,28 @@ async function boot() {
   // Outer chrome controls
   const btnLocal = document.getElementById('btn-local');
   const btnOnline = document.getElementById('btn-online');
+  const btnSaves = document.getElementById('btn-saves');
   const btnMute = document.getElementById('btn-mute');
   const btnFullscreen = document.getElementById('btn-fullscreen');
   const btnControls = document.getElementById('btn-controls');
   const statusPill = document.getElementById('status-pill');
   const btnAwayBot = document.getElementById('btn-away-bot');
+  const localRulesBar = document.getElementById('local-rules-bar');
+  const localPresetEl = document.getElementById('local-preset');
+  const localTimerEl = document.getElementById('local-timer');
 
   // Modals
   const controlsModal = document.getElementById('controls-modal');
   const lobbyModal = document.getElementById('lobby-modal');
+  const savesModal = document.getElementById('saves-modal');
+  const savesStatus = document.getElementById('saves-status');
+  const saveNameInput = document.getElementById('save-name-input');
+  const btnSaveNow = document.getElementById('btn-save-now');
+  const saveNowHint = document.getElementById('save-now-hint');
+  const savesListEl = document.getElementById('saves-list');
+  const btnImportSave = document.getElementById('btn-import-save');
+  const importSaveFile = document.getElementById('import-save-file');
+
   const lobbyEntry = document.getElementById('lobby-entry');
   const lobbyRoom = document.getElementById('lobby-room');
   const lobbyErr = document.getElementById('lobby-error');
@@ -40,6 +53,13 @@ async function boot() {
   const roomCodeDisp = document.getElementById('room-code-display');
   const roomSlotsEl = document.getElementById('room-slots');
   const roomTerrainEl = document.getElementById('room-terrain');
+  const roomPresetEl = document.getElementById('room-preset');
+  const roomTimerEl = document.getElementById('room-timer');
+  const btnLobbyLoadSave = document.getElementById('btn-lobby-load-save');
+  const lobbySaveBanner = document.getElementById('lobby-save-banner');
+  const lobbySaveTitle = document.getElementById('lobby-save-title');
+  const lobbySaveSub = document.getElementById('lobby-save-sub');
+  const btnClearLobbySave = document.getElementById('btn-clear-lobby-save');
   const btnAddBot = document.getElementById('btn-add-bot');
   const btnStartOnline = document.getElementById('btn-start-online');
   const btnCopyInvite = document.getElementById('btn-copy-invite');
@@ -85,8 +105,24 @@ async function boot() {
     roomCodeDisp.textContent = lobby.code;
     roomTerrainEl.value = String(lobby.krajina);
     roomTerrainEl.disabled = !lobby.isHost;
-    btnAddBot.hidden = !lobby.isHost || lobby.slots.length >= 5;
+    roomPresetEl.value = lobby.preset || 'balanced';
+    roomPresetEl.disabled = !lobby.isHost || Boolean(lobby.loadedSaveInfo);
+    roomTimerEl.value = String(lobby.turnTimer || 0);
+    roomTimerEl.disabled = !lobby.isHost;
+    btnLobbyLoadSave.hidden = !lobby.isHost;
+    if (lobby.loadedSaveInfo) {
+      lobbySaveBanner.hidden = false;
+      lobbySaveTitle.textContent = `Resuming Save · Round ${lobby.loadedSaveInfo.round} (${lobby.loadedSaveInfo.scene === 'shop' ? 'Shop' : 'Battle'})`;
+      lobbySaveSub.textContent = (lobby.loadedSaveInfo.players || [])
+        .map((p) => `${p.name}: ${p.score}`)
+        .join(' · ');
+      btnClearLobbySave.hidden = !lobby.isHost;
+    } else {
+      lobbySaveBanner.hidden = true;
+    }
+    btnAddBot.hidden = !lobby.isHost || Boolean(lobby.loadedSaveInfo) || lobby.slots.length >= 5;
     btnStartOnline.hidden = !lobby.isHost;
+    btnStartOnline.textContent = lobby.loadedSaveInfo ? 'Resume Match' : 'Start Match';
     btnStartOnline.disabled = lobby.slots.length < 2;
 
     // Preserve active name input state if a lobby update arrives while typing
@@ -213,7 +249,7 @@ async function boot() {
         sel.addEventListener('change', () => net.hostConfig('set_bot_dif', { index: idx, dif: sel.value }));
         rightEl.appendChild(sel);
 
-        if (lobby.isHost && lobby.slots.length > 2) {
+        if (lobby.isHost && !lobby.loadedSaveInfo && lobby.slots.length > 2) {
           const rm = document.createElement('button');
           rm.type = 'button';
           rm.className = 'btn-mini danger';
@@ -303,15 +339,19 @@ async function boot() {
     },
     onMatchStart: (msg) => {
       lobbyModal.hidden = true;
+      savesModal.hidden = true;
       game.startOnlineMatch({
         seed: msg.seed,
         krajina: msg.krajina,
+        preset: msg.preset,
+        turnTimer: msg.turnTimer,
+        savedState: msg.savedState || null,
         players: msg.players,
         mySlot: msg.mySlot,
         isHost: msg.isHost,
       });
       refreshAwayButton();
-      statusPill.textContent = `Online Room ${msg.code} · Round 1`;
+      statusPill.textContent = `Online Room ${msg.code} · Round ${game.gameRound}`;
     },
     onRemoteAim: (payload) => {
       stepSimulation(performance.now());
@@ -355,12 +395,237 @@ async function boot() {
     onError: (message) => showLobbyError(message),
   });
 
+  // ==================== MID-GAME SAVE STORAGE & UI ====================
+
+  const AUTOSAVE_KEY = 'tank3000_autosave_v1';
+  const SAVES_KEY = 'tank3000_saves_v1';
+  const MAX_MANUAL_SAVES = 10;
+
+  function readAutoSave() {
+    try {
+      const raw = localStorage.getItem(AUTOSAVE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeAutoSave(save) {
+    try {
+      localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(save));
+    } catch (err) {
+      console.warn('Auto-save failed:', err);
+    }
+  }
+
+  function readManualSaves() {
+    try {
+      const raw = localStorage.getItem(SAVES_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function writeManualSaves(arr) {
+    try {
+      localStorage.setItem(SAVES_KEY, JSON.stringify(arr.slice(0, MAX_MANUAL_SAVES)));
+    } catch (err) {
+      console.warn('Save storage failed:', err);
+    }
+  }
+
+  function showSavesStatus(msg, isErr = false) {
+    savesStatus.textContent = msg || '';
+    savesStatus.className = 'info-banner' + (isErr ? ' err' : '');
+    savesStatus.hidden = !msg;
+  }
+
+  function formatSaveTime(ts) {
+    if (!ts) return '';
+    try {
+      return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    } catch {
+      return '';
+    }
+  }
+
+  function exportSaveFile(save) {
+    const blob = new Blob([JSON.stringify(save, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `tank3000-round${save.gameRound || 1}-${(save.id || 'save').slice(-6)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  let savesOpenedFromLobby = false;
+
+  function resumeSaveEntry(save) {
+    try {
+      // 1. Host loading a save into an open online lobby
+      if (savesOpenedFromLobby && net.lobby && net.lobby.isHost && !net.lobby.inMatch) {
+        net.hostConfig('set_loaded_save', { save });
+        savesModal.hidden = true;
+        lobbyModal.hidden = false;
+        savesOpenedFromLobby = false;
+        return;
+      }
+
+      // 2. Host restoring mid-match inside an active online room (same player count)
+      if (game.mode === 'online' && game.isHost) {
+        if (save.playerData.length !== game.playerData.length) {
+          showSavesStatus(
+            `This save has ${save.playerData.length} players, while your current online match has ${game.playerData.length}. Leave to the Online Lobby and use "Load Save" to resume it with friends.`,
+            true
+          );
+          return;
+        }
+        game.loadSaveData(save, { mode: 'online', mySlot: game.mySlot, isHost: true });
+        net.sendAction({
+          type: 'state_sync',
+          forceImmediate: true,
+          ...game.buildSyncSnapshot(),
+        });
+        savesModal.hidden = true;
+        return;
+      }
+
+      // 3. Local resume (leave any guest room if connected)
+      if (net.roomCode) net.leaveRoom();
+      lobbyModal.hidden = true;
+      savesModal.hidden = true;
+      game.loadSaveData(save, { mode: 'local' });
+      localPresetEl.value = game.balancePreset;
+      localTimerEl.value = String(game.turnTimerSec);
+    } catch (err) {
+      showSavesStatus(err?.message || 'Could not load save.', true);
+    }
+  }
+
+  function renderSavesModal() {
+    showSavesStatus('');
+    const inOnlineLobbyHost = savesOpenedFromLobby && net.lobby && net.lobby.isHost && !net.lobby.inMatch;
+    const inOnlineGuest = game.mode === 'online' && !game.isHost;
+    const canSaveNow = game.canSaveGame() && !inOnlineLobbyHost;
+
+    btnSaveNow.disabled = !canSaveNow;
+    saveNameInput.disabled = !canSaveNow;
+    if (inOnlineLobbyHost) {
+      saveNowHint.textContent = 'Select a saved match below to load it into your online lobby so friends can join and resume together.';
+    } else if (canSaveNow) {
+      saveNowHint.textContent = `Ready to save Round ${game.gameRound} (${game.scene === 'shop' ? 'Shop' : 'Battle'}). Auto-save also updates every turn.`;
+    } else {
+      saveNowHint.textContent = 'Start a match (or wait for the current shot/explosion to finish) to create a new save.';
+    }
+
+    savesListEl.innerHTML = '';
+    const auto = readAutoSave();
+    const manuals = readManualSaves();
+    const allEntries = [];
+    if (auto) allEntries.push({ isAuto: true, save: auto });
+    for (const s of manuals) allEntries.push({ isAuto: false, save: s });
+
+    if (!allEntries.length) {
+      const empty = document.createElement('div');
+      empty.className = 'saves-empty';
+      empty.textContent = 'No saved matches yet. Start playing to auto-save every turn, or import a .json save file.';
+      savesListEl.appendChild(empty);
+      return;
+    }
+
+    const actionLabel = inOnlineLobbyHost
+      ? 'Load in Room'
+      : (game.mode === 'online' && game.isHost ? 'Sync Restore' : 'Resume');
+
+    allEntries.forEach(({ isAuto, save }) => {
+      const card = document.createElement('div');
+      card.className = 'save-card' + (isAuto ? ' autosave' : '');
+
+      const meta = document.createElement('div');
+      meta.className = 'save-meta';
+
+      const title = document.createElement('div');
+      title.className = 'save-title';
+      const titleText = document.createElement('span');
+      titleText.textContent = isAuto ? 'Auto-Save' : (save.label || `Round ${save.gameRound || 1}`);
+      title.appendChild(titleText);
+
+      const roundTag = document.createElement('span');
+      roundTag.className = 'save-tag';
+      roundTag.textContent = `R${save.gameRound || 1} · ${save.scene === 'shop' ? 'Shop' : 'Battle'}`;
+      title.appendChild(roundTag);
+
+      if (save.balancePreset === 'classic') {
+        const modeTag = document.createElement('span');
+        modeTag.className = 'save-tag classic';
+        modeTag.textContent = 'Classic';
+        title.appendChild(modeTag);
+      }
+
+      const sub = document.createElement('div');
+      sub.className = 'save-sub';
+      const scoreSummary = (save.playerData || [])
+        .map((p) => `${p.name} (${Math.round(p.total_score || 0)})`)
+        .join(' · ');
+      const when = formatSaveTime(save.savedAt);
+      sub.textContent = when ? `${when} — ${scoreSummary}` : scoreSummary;
+
+      meta.append(title, sub);
+
+      const actions = document.createElement('div');
+      actions.className = 'save-actions';
+
+      const btnRes = document.createElement('button');
+      btnRes.type = 'button';
+      btnRes.className = 'primary-btn small';
+      btnRes.style.padding = '5px 9px';
+      btnRes.style.fontSize = '11px';
+      btnRes.textContent = actionLabel;
+      if (inOnlineGuest) {
+        btnRes.title = 'Resuming will leave your current online room and continue locally';
+      }
+      btnRes.addEventListener('click', () => resumeSaveEntry(save));
+      actions.appendChild(btnRes);
+
+      const btnExp = document.createElement('button');
+      btnExp.type = 'button';
+      btnExp.className = 'secondary-btn small';
+      btnExp.textContent = 'Export';
+      btnExp.addEventListener('click', () => exportSaveFile(save));
+      actions.appendChild(btnExp);
+
+      if (!isAuto) {
+        const btnDel = document.createElement('button');
+        btnDel.type = 'button';
+        btnDel.className = 'btn-mini';
+        btnDel.textContent = '×';
+        btnDel.title = 'Delete save';
+        btnDel.addEventListener('click', () => {
+          const next = readManualSaves().filter((x) => x.id !== save.id);
+          writeManualSaves(next);
+          renderSavesModal();
+        });
+        actions.appendChild(btnDel);
+      }
+
+      card.append(meta, actions);
+      savesListEl.appendChild(card);
+    });
+  }
+
   game = new TankGame(renderer, sound, {
     onOnlineAim: (payload) => net.sendAim(payload),
     onOnlineAction: (payload) => net.sendAction(payload),
     onOnlineShopBuy: ({ slot, kind, index }) => net.sendShopBuy(slot, kind, index),
     onOnlineShopReady: () => net.sendShopReady(),
+    onAutoSave: (save) => writeAutoSave(save),
     onStatusChange: (st) => {
+      localRulesBar.hidden = !(st.mode === 'local' && (st.scene === 'menu1' || st.scene === 'menu2'));
       if (st.mode === 'online') {
         statusPill.textContent = `Online ${net.roomCode || ''} · R${st.round}${st.activePlayer ? ' · ' + st.activePlayer : ''}`;
       } else {
@@ -376,6 +641,7 @@ async function boot() {
     },
   });
   statusPill.textContent = 'Local · Setup';
+  localRulesBar.hidden = false;
 
   // Expose for debugging
   window.__TANK3000__ = { game, renderer, sound, net };
@@ -435,7 +701,7 @@ async function boot() {
 
   window.addEventListener('keydown', (ev) => {
     // Don't hijack keys when typing in modal inputs
-    if (!lobbyModal.hidden || !controlsModal.hidden) return;
+    if (!lobbyModal.hidden || !controlsModal.hidden || !savesModal.hidden) return;
     if (document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
     game.handleKeyDown(ev);
   });
@@ -448,15 +714,82 @@ async function boot() {
 
   // ==================== OUTER BAR & MODAL WIRING ====================
 
+  localPresetEl.addEventListener('change', () => {
+    game.setBalancePreset(localPresetEl.value);
+  });
+
+  localTimerEl.addEventListener('change', () => {
+    game.setTurnTimer(Number(localTimerEl.value));
+  });
+
+  btnSaves.addEventListener('click', () => {
+    sound.unlock();
+    savesOpenedFromLobby = false;
+    renderSavesModal();
+    savesModal.hidden = false;
+  });
+
+  btnLobbyLoadSave.addEventListener('click', () => {
+    savesOpenedFromLobby = true;
+    renderSavesModal();
+    savesModal.hidden = false;
+  });
+
+  btnClearLobbySave.addEventListener('click', () => {
+    net.hostConfig('clear_loaded_save');
+  });
+
+  btnSaveNow.addEventListener('click', () => {
+    if (!game.canSaveGame()) {
+      showSavesStatus('Wait until the current shot finishes before saving.', true);
+      return;
+    }
+    const save = game.buildSaveData(saveNameInput.value.trim());
+    const list = readManualSaves();
+    list.unshift(save);
+    writeManualSaves(list);
+    saveNameInput.value = '';
+    renderSavesModal();
+    showSavesStatus(`Saved "${save.label}"!`);
+  });
+
+  btnImportSave.addEventListener('click', () => {
+    importSaveFile.value = '';
+    importSaveFile.click();
+  });
+
+  importSaveFile.addEventListener('change', async () => {
+    const file = importSaveFile.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!parsed || !Array.isArray(parsed.playerData) || parsed.playerData.length < 2) {
+        throw new Error('Not a valid Tank 3000 save file.');
+      }
+      parsed.id = `save-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      parsed.savedAt = parsed.savedAt || Date.now();
+      const list = readManualSaves();
+      list.unshift(parsed);
+      writeManualSaves(list);
+      renderSavesModal();
+      showSavesStatus(`Imported "${parsed.label || file.name}"!`);
+    } catch (err) {
+      showSavesStatus(err?.message || 'Could not import save file.', true);
+    }
+  });
+
   btnLocal.addEventListener('click', () => {
     net.leaveRoom();
     lobbyModal.hidden = true;
+    savesModal.hidden = true;
     game.resetToTitle();
   });
 
   btnOnline.addEventListener('click', () => {
     sound.unlock();
     showLobbyError('');
+    savesModal.hidden = true;
     lobbyModal.hidden = false;
   });
 
@@ -480,8 +813,16 @@ async function boot() {
 
   document.querySelectorAll('[data-close-modal]').forEach((el) => {
     el.addEventListener('click', () => {
-      controlsModal.hidden = true;
-      lobbyModal.hidden = true;
+      const modal = el.closest('.modal-backdrop');
+      if (modal) {
+        modal.hidden = true;
+        if (modal === savesModal) savesOpenedFromLobby = false;
+      } else {
+        controlsModal.hidden = true;
+        lobbyModal.hidden = true;
+        savesModal.hidden = true;
+        savesOpenedFromLobby = false;
+      }
     });
   });
 
@@ -533,6 +874,14 @@ async function boot() {
 
   roomTerrainEl.addEventListener('change', () => {
     net.hostConfig('set_krajina', { krajina: Number(roomTerrainEl.value) });
+  });
+
+  roomPresetEl.addEventListener('change', () => {
+    net.hostConfig('set_preset', { preset: roomPresetEl.value });
+  });
+
+  roomTimerEl.addEventListener('change', () => {
+    net.hostConfig('set_turn_timer', { turnTimer: Number(roomTimerEl.value) });
   });
 
   btnAddBot.addEventListener('click', () => net.hostConfig('add_bot'));

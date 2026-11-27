@@ -1,7 +1,11 @@
 // 5-difficulty AI artillery controller with physics ballistic solver,
-// smart weapon/special usage, and full between-round shop economy.
+// smart weapon/special usage, air-strike evasion, and full between-round shop economy.
 
-import { STAGE_W, STAGE_H, WEAPONS, SPECIALS, SHIELD_TIERS, SOUNDS } from './constants.js';
+import {
+  STAGE_W, STAGE_H, WEAPONS, SPECIALS, SHIELD_TIERS, SOUNDS,
+  MAX_UPGRADE_LEVEL, getMaxPower,
+} from './constants.js';
+import { rollerAvgTopY } from './weapons.js';
 
 // Difficulty profiles: scatter shrinks on follow-up shots against the same target
 const DIFFICULTY_PROFILE = {
@@ -129,6 +133,7 @@ function simulateTrajectory(tank, target, game, rotace, power, opts = {}) {
         x,
         y,
         t,
+        voy,
         dist: Math.hypot(x - target.x, y - target.y),
         selfDist: Math.hypot(x - tank.x, y - tank.y),
       };
@@ -137,7 +142,7 @@ function simulateTrajectory(tank, target, game, rotace, power, opts = {}) {
     // Tank / shield collision check
     for (let i = 0; i < tanks.length; i++) {
       const other = tanks[i];
-      if (!other.data.live) continue;
+      if (!other.data.live || other.data.energy <= 0) continue;
       if (other.tankNumber !== tank.tankNumber) {
         if (other.hitTestProjectile(x, y, 1.5, 1.5, true)) {
           const isTarget = other.tankNumber === target.tankNumber;
@@ -151,6 +156,7 @@ function simulateTrajectory(tank, target, game, rotace, power, opts = {}) {
             x,
             y,
             t,
+            voy,
             dist: isTarget ? 0 : Math.hypot(x - target.x, y - target.y),
             selfDist: Math.hypot(x - tank.x, y - tank.y),
           };
@@ -165,6 +171,7 @@ function simulateTrajectory(tank, target, game, rotace, power, opts = {}) {
           x,
           y,
           t,
+          voy,
           dist: Math.hypot(x - target.x, y - target.y),
           selfDist: 0,
         };
@@ -178,7 +185,7 @@ function simulateTrajectory(tank, target, game, rotace, power, opts = {}) {
     // Terrain impact
     if (x >= 0 && x < STAGE_W && terrain.hitPoint(x, y, 1.5)) {
       if (isRoller) {
-        return simulateRollPhase(tank, target, game, x, uphill, t);
+        return simulateRollPhase(tank, target, game, x, uphill, t, voy);
       }
       const dist = Math.hypot(x - target.x, y - target.y);
       const selfDist = Math.hypot(x - tank.x, y - tank.y);
@@ -192,6 +199,7 @@ function simulateTrajectory(tank, target, game, rotace, power, opts = {}) {
         x,
         y,
         t,
+        voy,
         dist,
         selfDist,
       };
@@ -210,24 +218,25 @@ function simulateTrajectory(tank, target, game, rotace, power, opts = {}) {
     x: x0,
     y: y0,
     t,
+    voy,
     dist: 999,
     selfDist: 999,
   };
 }
 
-function simulateRollPhase(tank, target, game, startX, uphill, impactT) {
+function simulateRollPhase(tank, target, game, startX, uphill, impactT, voy) {
   const terrain = game.terrain;
   const tanks = game.tanks;
   let rx = startX;
   let smer = null;
   let rollStart = true;
 
-  for (let step = 0; step < 300; step++) {
+  for (let step = 0; step < 260; step++) {
     const ix = Math.round(rx);
-    if (ix <= 1 || ix >= STAGE_W - 2) {
+    if (ix <= 2 || ix >= STAGE_W - 3) {
       return {
         hit: false, oob: true, direct: false, hitTarget: false, selfHit: false,
-        x: rx, y: terrain.topY(Math.max(0, Math.min(STAGE_W - 1, ix))), t: impactT,
+        x: rx, y: terrain.topY(Math.max(0, Math.min(STAGE_W - 1, ix))), t: impactT, voy,
         dist: 999, selfDist: 999,
       };
     }
@@ -235,48 +244,44 @@ function simulateRollPhase(tank, target, game, startX, uphill, impactT) {
 
     for (let i = 0; i < tanks.length; i++) {
       const other = tanks[i];
-      if (!other.data.live) continue;
+      if (!other.data.live || other.data.energy <= 0) continue;
       if (other.hitTestProjectile(rx, cury, 1.5, 1.5, true)) {
         const isSelf = other.tankNumber === tank.tankNumber;
         const isTarget = other.tankNumber === target.tankNumber;
         return {
           hit: true, oob: false, direct: isTarget, hitTarget: isTarget, hitEnemy: !isSelf, selfHit: isSelf,
-          x: rx, y: cury, t: impactT,
+          x: rx, y: cury, t: impactT, voy,
           dist: isTarget ? 0 : Math.hypot(rx - target.x, cury - target.y),
           selfDist: isSelf ? 0 : Math.hypot(rx - tank.x, cury - tank.y),
         };
       }
     }
 
-    const curly = terrain.topY(ix - 1);
-    const curpy = terrain.topY(ix + 1);
+    const curAvg = rollerAvgTopY(terrain, ix);
+    const leftAvg = rollerAvgTopY(terrain, ix - 2);
+    const rightAvg = rollerAvgTopY(terrain, ix + 2);
+
     if (rollStart) {
       if (!uphill) {
-        if (curly < cury && curpy < cury) break;
-        if (!(curly < cury)) smer = 'left';
-        else if (!(curpy < cury)) smer = 'right';
+        if (leftAvg < curAvg - 1.5 && rightAvg < curAvg - 1.5) break;
+        smer = leftAvg >= rightAvg ? 'left' : 'right';
       } else {
-        if (cury < curly && cury < curpy) break;
-        if (!(curly < cury)) smer = 'right';
-        else if (!(curpy < cury)) smer = 'left';
+        if (leftAvg > curAvg + 1.5 && rightAvg > curAvg + 1.5) break;
+        smer = leftAvg <= rightAvg ? 'left' : 'right';
       }
       rollStart = false;
     }
 
-    const lastx = ix;
-    if (smer === 'left') {
-      const ny = terrain.topY(ix - 1);
-      const ok = uphill ? !(cury < ny) : !(ny < cury);
-      if (ok) rx -= 1;
-      else break;
-    } else if (smer === 'right') {
-      const ny = terrain.topY(ix + 1);
-      const ok = uphill ? !(cury < ny) : !(ny < cury);
-      if (ok) rx += 1;
-      else break;
-    }
-    if (lastx === Math.round(rx)) {
-      smer = tank.x < rx ? 'right' : 'left';
+    const dir = smer === 'left' ? -1 : 1;
+    const nextAvg = rollerAvgTopY(terrain, ix + dir * 2);
+    const canContinue = uphill
+      ? nextAvg <= curAvg + 2.0
+      : nextAvg >= curAvg - 2.0;
+
+    if (canContinue) {
+      rx += dir;
+    } else {
+      break;
     }
   }
 
@@ -285,15 +290,15 @@ function simulateRollPhase(tank, target, game, startX, uphill, impactT) {
   const selfDist = Math.hypot(rx - tank.x, ry - tank.y);
   return {
     hit: true, oob: false, direct: dist <= 10, hitTarget: dist <= 16, hitEnemy: dist <= 16, selfHit: selfDist <= 14,
-    x: rx, y: ry, t: impactT, dist, selfDist,
+    x: rx, y: ry, t: impactT, voy, dist, selfDist,
   };
 }
 
 // Find optimal (rotace, power) using coarse physics sweep + integer local refinement
 export function solveBallisticShot(tank, target, game, opts = {}) {
-  const maxPow = Math.max(1, Math.min(100, Math.floor(tank.data.energy)));
+  const maxPow = Math.max(1, getMaxPower(tank.data.energy));
   const minSafeSelf = opts.minSafeSelf ?? 18;
-  const requireSplitTime = Boolean(opts.requireSplitTime);
+  const requireApexSplit = Boolean(opts.requireApexSplit);
   const targetRight = target.x >= tank.x;
   const vitr = game.terrain.vitr;
 
@@ -308,17 +313,18 @@ export function solveBallisticShot(tank, target, game, opts = {}) {
       s += (minSafeSelf - sim.selfDist) * 25 + 400;
     }
     if (sim.oob) s += 300;
-    if (requireSplitTime && sim.t < 3.05) {
-      s += 250;
+    if (requireApexSplit) {
+      const splitT = Math.max(0.6, ((sim.voy || 0) + 2.5) / 9.81);
+      if (sim.t < splitT + 0.35 || (sim.voy || 0) < 10) {
+        s += 250;
+      }
     }
     if (sim.direct && sim.hitTarget) {
-      // Slight tie-breaker favoring cleaner arcs that stay safely away from self
       s = -100 + Math.abs(rot - (targetRight ? 132 : 48)) * 0.02 - Math.min(40, sim.selfDist) * 0.05;
     }
     return s;
   };
 
-  // Coarse grid search (handles low-energy tanks with maxPow < 8 cleanly)
   const powStart = maxPow < 8 ? 1 : 8;
   const powStep = maxPow < 8 ? 1 : 5;
   const topSeeds = [];
@@ -334,7 +340,6 @@ export function solveBallisticShot(tank, target, game, opts = {}) {
     }
   }
 
-  // Fine integer refinement around best coarse regions
   let best = topSeeds[0];
   if (!best) {
     const fbRot = targetRight ? 135 : 45;
@@ -364,7 +369,6 @@ export function solveBallisticShot(tank, target, game, opts = {}) {
     }
   }
 
-  // Extra half-step micro-refinement if not yet a direct bullseye
   if (!best.sim.direct && best.sim.dist < 40) {
     const baseR = best.rot;
     const baseP = best.pow;
@@ -389,7 +393,7 @@ export function solveBallisticShot(tank, target, game, opts = {}) {
 export function aiSelectTarget(tank, game) {
   const prof = getProfile(tank.dif);
   const candidates = game.tanks.filter(
-    (other) => other.tankNumber !== tank.tankNumber && other.data.live
+    (other) => other.tankNumber !== tank.tankNumber && other.data.live && other.data.energy > 0
   );
   if (!candidates.length) {
     tank.target = null;
@@ -397,7 +401,6 @@ export function aiSelectTarget(tank, game) {
   }
 
   if (!prof.smartTarget) {
-    // Nearest living enemy
     let best = candidates[0];
     let bestD = Math.abs(tank.x - best.x);
     for (const c of candidates) {
@@ -411,18 +414,16 @@ export function aiSelectTarget(tank, game) {
     return best;
   }
 
-  // Smart threat & finish-off scoring for Normal / Hard / Very Hard
+  // Smart threat, leader bounty & finish-off scoring for Normal / Hard / Very Hard
   let best = candidates[0];
   let bestScore = -Infinity;
   for (const c of candidates) {
     const dist = Math.abs(tank.x - c.x);
     let score = 200 - dist * 0.25;
-    // Prioritize finishing low-HP enemies (kill bounty + eliminate threat)
     if (!c.shActive && c.data.energy <= 45) score += 90;
     else if (!c.shActive && c.data.energy <= 75) score += 35;
-    // Slight focus on score leader
-    score += Math.min(60, (c.data.total_score || 0) / 800);
-    // Slight preference to finish current target if already dialed in
+    if (game.isScoreLeader?.(c.tankNumber)) score += 55;
+    score += Math.min(50, (c.data.total_score || 0) / 800);
     if (tank.target && tank.target.tankNumber === c.tankNumber) score += 20;
     if (score > bestScore) {
       bestScore = score;
@@ -435,12 +436,14 @@ export function aiSelectTarget(tank, game) {
 
 function findBestTeleportSpot(tank, game) {
   const terrain = game.terrain;
+  const strikes = game.pendingStrikes || [];
   let bestX = tank.x;
   let bestScore = -Infinity;
-  for (let x = 40; x <= STAGE_W - 40; x += 15) {
+  for (let x = 45; x <= STAGE_W - 45; x += 15) {
     const topY = terrain.topY(x);
     if (topY > STAGE_H - 35 || topY < 75) continue;
-    // Prefer higher ridges with open sky and safe spacing from enemies
+    // Stay well clear of any pending Air Strike target zone
+    if (strikes.some((s) => Math.abs(x - s.targetX) < 85)) continue;
     let minEnemyDist = 999;
     for (const other of game.tanks) {
       if (other.tankNumber === tank.tankNumber || !other.data.live) continue;
@@ -449,7 +452,6 @@ function findBestTeleportSpot(tank, game) {
     if (minEnemyDist < 55) continue;
     const leftY = terrain.topY(x - 10);
     const rightY = terrain.topY(x + 10);
-    // Avoid deep pits (neighbors much higher than x)
     const pitPenalty = Math.max(0, (topY - leftY)) + Math.max(0, (topY - rightY));
     const sc = (STAGE_H - topY) * 1.1 - pitPenalty * 2.5 + Math.min(180, minEnemyDist) * 0.4;
     if (sc > bestScore) {
@@ -462,30 +464,35 @@ function findBestTeleportSpot(tank, game) {
 
 function aiUseDefensiveSpecials(tank, game, prof) {
   const pd = tank.data;
+  const strikes = game.pendingStrikes || [];
+  const threatenedStrike = strikes.find((s) => Math.abs(s.targetX - tank.x) < 75) || null;
 
   // 1. Ensure parachute is enabled if owned
   if (pd.specials[0] > 0 && !tank.par) {
     game.toggleParachute(false, true);
   }
 
-  // 2. Use Repair Kits when damaged
-  if (pd.specials[1] > 0 && pd.energy < pd.max_energy * prof.useRepairThresh) {
+  // 2. Use Repair Kits when damaged (or braced for incoming Air Strike)
+  const repairThresh = threatenedStrike ? Math.max(0.85, prof.useRepairThresh) : prof.useRepairThresh;
+  if (pd.specials[1] > 0 && pd.energy < pd.max_energy * repairThresh) {
     let used = 0;
     while (
       used < prof.maxRepairsPerTurn &&
       pd.specials[1] > 0 &&
-      pd.energy < pd.max_energy - 5 &&
-      pd.energy < pd.max_energy * Math.min(0.92, prof.useRepairThresh + 0.2)
+      pd.energy < pd.max_energy - 4 &&
+      pd.energy < pd.max_energy * Math.min(0.95, repairThresh + 0.2)
     ) {
       game.useRepair(false, true);
       used++;
     }
   }
 
-  // 3. Activate an owned Shield if unshielded and threatened
-  if (!tank.shActive && pd.energy <= pd.max_energy * prof.shieldHpThresh) {
-    if ((game.aiRng || game.rng).nextFloat() < prof.shieldChance) {
-      // Higher difficulties prefer stronger shields; lower difficulties start with weaker shields
+  // 3. Activate an owned Shield if unshielded, allowed this round, and threatened
+  if (!tank.shActive && !tank.shieldUsedThisRound) {
+    const shouldShield = threatenedStrike
+      ? prof.shopMaxTier >= 2
+      : (pd.energy <= pd.max_energy * prof.shieldHpThresh && (game.aiRng || game.rng).nextFloat() < prof.shieldChance);
+    if (shouldShield) {
       const tiers = prof.shopMaxTier >= 4 ? [4, 3, 2, 1] : prof.shopMaxTier >= 3 ? [3, 2, 1, 4] : [1, 2, 3, 4];
       for (const tier of tiers) {
         const spec = SHIELD_TIERS[tier];
@@ -496,13 +503,22 @@ function aiUseDefensiveSpecials(tank, game, prof) {
       }
     }
   }
+
+  return threatenedStrike;
 }
 
-function aiPickWeaponAndPlan(tank, target, game, prof) {
+function aiPickWeaponAndPlan(tank, target, game, prof, threatenedStrike) {
   const guns = tank.data.guns;
   const rng = game.aiRng || game.rng;
 
-  // Solve primary direct/arc ballistic shot first
+  // If standing directly inside an incoming Air Strike flare zone, escape via Teleport (if owned)!
+  if (threatenedStrike && prof.useTeleport && tank.data.specials[7] > 0) {
+    const spot = findBestTeleportSpot(tank, game);
+    if (Math.abs(spot.x - threatenedStrike.targetX) >= 80) {
+      return { action: 'teleport', spot };
+    }
+  }
+
   const baseSol = solveBallisticShot(tank, target, game, {
     minSafeSelf: prof.selfSafeCheck ? 20 : 0,
   });
@@ -518,10 +534,9 @@ function aiPickWeaponAndPlan(tank, target, game, prof) {
     }
   }
 
-  // Decide whether to use special weapons this turn
   const wantSpecial = rng.nextFloat() < prof.useSpecialWeaponsChance;
 
-  // Air Strike (13): devastating against shielded, dug-in, or blocked targets
+  // Air Strike (13): call in delayed strike against shielded, dug-in, or blocked targets
   if (wantSpecial && guns[13] > 0 && (blocked || target.shActive || target.data.energy >= 65)) {
     const jitter = prof.airStrikeJitter > 0 ? (rng.nextFloat() * 2 - 1) * prof.airStrikeJitter : 0;
     return {
@@ -532,14 +547,13 @@ function aiPickWeaponAndPlan(tank, target, game, prof) {
     };
   }
 
-  // If target is nearly dead (<= 15 HP, no shield) and we have a clean shot, don't waste expensive nukes
+  // If target is nearly dead (<= 15 HP, no shield) and we have a clean shot, save heavy ammo
   if (!target.shActive && target.data.energy <= 15 && baseSol.sim.hitTarget) {
     const gun = guns[1] > 0 && distToTarget > 20 ? 1 : 0;
     return { action: 'fire', gun, sol: baseSol };
   }
 
   if (wantSpecial) {
-    // Check Rollers (V1 downhill: 9,8,7; V2 uphill: 12,11,10) when slope favors them or direct is blocked
     if (prof.useRollers) {
       const rollerOrder = [
         { id: 9, uphill: false, safe: 55 },
@@ -552,7 +566,6 @@ function aiPickWeaponAndPlan(tank, target, game, prof) {
       for (const r of rollerOrder) {
         if (guns[r.id] <= 0) continue;
         if (prof.selfSafeCheck && distToTarget < r.safe) continue;
-        // Prefer trying rollers when target is blocked or ~30% of turns for variety
         if (!blocked && rng.nextFloat() > 0.35) continue;
         const rSol = solveBallisticShot(tank, target, game, {
           isRoller: true,
@@ -565,21 +578,20 @@ function aiPickWeaponAndPlan(tank, target, game, prof) {
       }
     }
 
-    // Check Hot Shower (6) & Shower (5) when long-arc flight time >= 3.05s triggers clean mid-air split
+    // Shower (5) & Hot Shower (6): apex-splitting works at any distance
     const showerIds = target.shActive || target.data.energy >= 65 ? [6, 5] : [5, 6];
     for (const sid of showerIds) {
       if (guns[sid] <= 0) continue;
-      if (prof.selfSafeCheck && distToTarget < 65) continue;
+      if (prof.selfSafeCheck && distToTarget < 55) continue;
       const shSol = solveBallisticShot(tank, target, game, {
-        minSafeSelf: prof.selfSafeCheck ? 42 : 0,
-        requireSplitTime: true,
+        minSafeSelf: prof.selfSafeCheck ? 38 : 0,
+        requireApexSplit: true,
       });
-      if (shSol.sim.t >= 3.05 && shSol.sim.dist <= 28) {
+      if (shSol.sim.dist <= 28 && (shSol.sim.voy || 0) >= 10) {
         return { action: 'fire', gun: sid, sol: shSol };
       }
     }
 
-    // Heavy & mid-tier direct explosives ordered by tactical power & self-safety
     const blastOrder = [
       { id: 3, safe: 88, preferHeavy: true },  // Atom bomb
       { id: 2, safe: 52, preferHeavy: false }, // Small atom bomb
@@ -587,7 +599,6 @@ function aiPickWeaponAndPlan(tank, target, game, prof) {
       { id: 1, safe: 22, preferHeavy: false }, // Missile
     ];
 
-    // Check if multiple enemies are clustered near target -> boost heavy bomb preference
     const nearbyEnemies = game.tanks.filter(
       (o) => o.data.live && o.tankNumber !== tank.tankNumber && Math.abs(o.x - target.x) < 75
     ).length;
@@ -596,9 +607,8 @@ function aiPickWeaponAndPlan(tank, target, game, prof) {
       if (guns[b.id] <= 0) continue;
       if (prof.selfSafeCheck && baseSol.sim.selfDist < b.safe) continue;
       if (b.preferHeavy && !target.shActive && target.data.energy < 45 && nearbyEnemies < 2) {
-        continue; // Save Atom Bomb for healthy / shielded / clustered enemies
+        continue;
       }
-      // Verify exact trajectory respects this bomb's larger self-safe radius
       const sol =
         prof.selfSafeCheck && baseSol.sim.selfDist < b.safe
           ? solveBallisticShot(tank, target, game, { minSafeSelf: b.safe })
@@ -609,7 +619,6 @@ function aiPickWeaponAndPlan(tank, target, game, prof) {
     }
   }
 
-  // Fallback to Missile (if safe) or Small Missile (infinite)
   if (guns[1] > 0 && (!prof.selfSafeCheck || baseSol.sim.selfDist >= 22)) {
     return { action: 'fire', gun: 1, sol: baseSol };
   }
@@ -630,10 +639,8 @@ export function aiBuyInShop(slot, game) {
   const tryBuy = (kind, index) => {
     const item = kind === 'weapon' ? WEAPONS[index] : SPECIALS[index];
     if (!item || item.price <= 0) return false;
-    if (pd.score - item.price < minReserve && pd.score >= minReserve) {
-      // Allow spending reserve on essential defense or first good weapon
-      if (pd.score < item.price) return false;
-    }
+    if (kind === 'special' && item.maxLevel && pd.specials[index] >= item.maxLevel) return false;
+    if (pd.score < item.price) return false;
     return game.applyShopPurchase(slot, kind, index, false, true);
   };
 
@@ -647,7 +654,7 @@ export function aiBuyInShop(slot, game) {
   if (pd.specials[1] < (prof.shopMaxTier >= 4 ? 4 : 2) && pd.score >= SPECIALS[1].price && purchases < maxPurchases) {
     if (tryBuy('special', 1)) purchases++;
   }
-  if (pd.specials[2] < 100 && pd.score >= SPECIALS[2].price && purchases < maxPurchases) {
+  if (pd.specials[2] < 80 && pd.score >= SPECIALS[2].price && purchases < maxPurchases) {
     if (tryBuy('special', 2)) purchases++;
   }
 
@@ -668,50 +675,44 @@ export function aiBuyInShop(slot, game) {
     }
   }
 
-  // 3. Permanent Tank Upgrades (Energy, Armor, Hill Move, Engine) on Normal+
+  // 3. Permanent Tank Upgrades (capped at MAX_UPGRADE_LEVEL = 5)
   if (prof.shopMaxTier >= 3 && purchases < maxPurchases) {
-    // Upgrade Armor (9) up to level 5
-    if (pd.specials[9] < 5 && pd.score >= SPECIALS[9].price && rng.nextFloat() < 0.65) {
+    if (pd.specials[9] < MAX_UPGRADE_LEVEL && pd.score >= SPECIALS[9].price && rng.nextFloat() < 0.65) {
       if (tryBuy('special', 9)) purchases++;
     }
-    // Upgrade Energy (8) up to level 5
-    if (pd.specials[8] < 5 && pd.score >= SPECIALS[8].price && rng.nextFloat() < 0.65) {
+    if (pd.specials[8] < MAX_UPGRADE_LEVEL && pd.score >= SPECIALS[8].price && rng.nextFloat() < 0.65) {
       if (tryBuy('special', 8)) purchases++;
     }
-    // Teleport (7) on Hard / Very Hard if out
-    if (prof.useTeleport && pd.specials[7] < 1 && pd.score >= SPECIALS[7].price + 5000) {
+    if (prof.useTeleport && pd.specials[7] < 1 && pd.score >= SPECIALS[7].price + 4000) {
       if (tryBuy('special', 7)) purchases++;
     }
-    // Hill move (11) / Engine (10) occasionally
     if (pd.specials[11] < 2 && pd.score >= SPECIALS[11].price && rng.nextFloat() < 0.3) {
       if (tryBuy('special', 11)) purchases++;
     }
   }
 
-  // 4. Buy Weapons with remaining budget (weighted by difficulty tier)
+  // 4. Buy Weapons with remaining budget
   const weaponPools = {
-    1: [1, 7, 4],                                      // Very easy
-    2: [1, 4, 7, 8, 2],                                // Easy
-    3: [2, 4, 5, 8, 11, 1],                            // Normal
-    4: [3, 2, 5, 13, 4, 9, 12, 8, 1],                  // Hard
-    5: [3, 6, 13, 2, 5, 9, 12, 4, 1],                  // Very hard
+    1: [1, 7, 4],
+    2: [1, 4, 7, 8, 2],
+    3: [2, 4, 5, 8, 11, 1],
+    4: [3, 2, 5, 13, 4, 9, 12, 8, 1],
+    5: [3, 6, 13, 2, 5, 9, 12, 4, 1],
   };
   const pool = weaponPools[prof.shopMaxTier] || weaponPools[3];
 
   let safety = 0;
   while (purchases < maxPurchases && pd.score >= 2000 && safety++ < 25) {
     if (pd.score <= minReserve) break;
-    // Filter affordable weapons (avoid hoarding > 6 of an ultra-expensive nuke)
     const affordable = pool.filter((wid) => {
       const w = WEAPONS[wid];
       if (!w || w.price <= 0 || pd.score < w.price) return false;
       if (w.price >= 13000 && pd.guns[wid] >= 4) return false;
-      if (wid === 4 && pd.guns[4] >= 12) return false;
+      if (wid === 4 && pd.guns[4] >= 10) return false;
       return true;
     });
     if (!affordable.length) break;
 
-    // Higher difficulties bias toward the top of their pool (strongest bombs)
     const pickIdx =
       prof.shopMaxTier >= 4 && rng.nextFloat() < 0.65
         ? rng.random(Math.min(3, affordable.length))
@@ -730,7 +731,7 @@ export function aiBuyInShop(slot, game) {
 export function aiPrepareShot(tank, game) {
   let prep = true;
   const targetRot = Math.max(0, Math.min(180, Math.round(tank.pRotace * 2) / 2));
-  const maxPow = Math.max(0, Math.min(100, tank.data.energy));
+  const maxPow = Math.max(0, getMaxPower(tank.data.energy));
   const targetPow = Math.max(0, Math.min(maxPow, Math.round(tank.pPower * 2) / 2));
 
   const diffRot = Math.abs(tank.rotace - targetRot);
@@ -784,8 +785,8 @@ export function tickAI(tank, game) {
     const prof = getProfile(tank.dif);
     const prevTargetNum = tank.target?.tankNumber ?? 0;
 
-    // 1. Defensive specials (Parachute, Repair Kits, Shields)
-    aiUseDefensiveSpecials(tank, game, prof);
+    // 1. Defensive specials & check for incoming Air Strike flares
+    const threatenedStrike = aiUseDefensiveSpecials(tank, game, prof);
 
     // 2. Select best target
     const target = aiSelectTarget(tank, game);
@@ -798,7 +799,7 @@ export function tickAI(tank, game) {
     }
 
     // 3. Pick weapon & compute ballistic plan
-    const plan = aiPickWeaponAndPlan(tank, target, game, prof);
+    const plan = aiPickWeaponAndPlan(tank, target, game, prof, threatenedStrike);
 
     if (plan.action === 'teleport') {
       game.beginTeleport(false, true);
@@ -825,30 +826,39 @@ export function tickAI(tank, game) {
       }
     }
 
-    // Standard / Roller / Cluster ballistic fire plan
     const sol = plan.sol || solveBallisticShot(tank, target, game, {
       minSafeSelf: prof.selfSafeCheck ? 20 : 0,
     });
     const gunId = typeof plan.gun === 'number' ? plan.gun : 0;
     game.selectWeapon(gunId, false, true);
 
-    // Apply difficulty scatter (tightens on consecutive turns against same target)
     const decay = Math.pow(prof.followUpDecay, tank.aiConsecShots || 0);
     const aiRng = game.aiRng || game.rng;
     const rotErr = (aiRng.nextFloat() * 2 - 1) * prof.rotScatter * decay;
     const powErr = (aiRng.nextFloat() * 2 - 1) * prof.powScatter * decay;
-    const maxPow = Math.max(0, Math.min(100, tank.data.energy));
+    const maxPow = Math.max(0, getMaxPower(tank.data.energy));
     const minPow = Math.min(2, maxPow);
 
     tank.pRotace = Math.max(1, Math.min(179, sol.rot + rotErr));
     tank.pPower = Math.max(minPow, Math.min(maxPow, sol.pow + powErr));
     tank.pMove = false;
+
+    // If threatened by an incoming Air Strike and didn't teleport, drive out of the flare zone using fuel!
+    if (threatenedStrike && tank.data.fuel > 10 && prof.shopMaxTier >= 2) {
+      const escapeDir = tank.x >= threatenedStrike.targetX ? 1 : -1;
+      const targetEscX = Math.max(30, Math.min(STAGE_W - 30, threatenedStrike.targetX + escapeDir * 78));
+      if (Math.abs(targetEscX - tank.x) > 10) {
+        tank.pX = targetEscX;
+        tank.pMove = true;
+      }
+    }
+
     tank.firstFrame = false;
   }
 
   tank._aiTurnFrames = (tank._aiTurnFrames || 0) + 1;
   if (aiPrepareShot(tank, game) || tank._aiTurnFrames >= 75) {
-    tank.power = Math.max(0, Math.min(100, tank.data.energy, tank.power));
+    tank.power = Math.max(0, Math.min(getMaxPower(tank.data.energy), tank.power));
     game.sound.stop(SOUNDS.TURRET_MOVE);
     tank.lastWind = game.terrain.vitr;
     tank.firstFrame = true;

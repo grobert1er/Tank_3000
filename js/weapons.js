@@ -1,6 +1,18 @@
-// Projectile ballistics, rollers (V1 downhill & V2 uphill), cluster bombs, air strike, and explosions
+// Projectile ballistics, smoothed rollers (V1 downhill & V2 uphill), apex-split clusters, delayed air strike, and explosions
 
 import { STAGE_W, STAGE_H, WEAPONS, SUB_WEAPONS, SOUNDS } from './constants.js';
+
+// 3-column smoothed terrain height sample so rollers don't detonate on 1px bumps
+export function rollerAvgTopY(terrain, cx) {
+  let sum = 0;
+  let cnt = 0;
+  for (let dx = -1; dx <= 1; dx++) {
+    const x = Math.max(0, Math.min(STAGE_W - 1, Math.round(cx + dx)));
+    sum += terrain.topY(x);
+    cnt++;
+  }
+  return cnt ? sum / cnt : STAGE_H;
+}
 
 export class Projectile {
   constructor(opts) {
@@ -20,23 +32,23 @@ export class Projectile {
     this.g = 9.81;
     this.t = opts.t ?? 0;
     this.tStep = opts.tStep ?? 0.1;
-    this.inc = opts.inc ?? 0; // lateral spread for Shower / Hot shower clusters
+    this.inc = opts.inc ?? 0;
     this.noWind = Boolean(opts.noWind);
 
     if (opts.vox !== undefined && opts.voy !== undefined) {
       this.vox = opts.vox;
       this.voy = opts.voy;
     } else {
-      // Initial launch velocity components
       this.vox = Math.cos((Math.PI / 180) * this.uhel) * this.vo;
       this.voy = Math.sin(0.017 * this.uhel) * this.vo;
     }
 
     this.hit = true; // true until projectile exits owner tank/shield
-    this.frame = 1; // 1 = flying, 2..12 = exploding, 12..14 = waiting for sub-shots
+    this.frame = 1; // 1 = flying, 2..12 = exploding
     this.exploding = false;
     this.done = false;
     this.waitingForSubs = false;
+    this.hasSplit = false;
     this.endEarly = false;
     this.subDone = [];
     this.expectedSubs = 0;
@@ -44,9 +56,10 @@ export class Projectile {
     // Roller state (V1 downhill / V2 uphill)
     this.isRoller = this.spec.kind === 'roller';
     this.uphill = Boolean(this.spec.uphill);
-    this.first = true;  // airborne phase
+    this.first = true;   // airborne phase
     this.second = false; // rolling phase
     this.rollStart = true;
+    this.rollSteps = 0;
     this.smer = null; // 'left' | 'right'
   }
 
@@ -59,7 +72,6 @@ export class Projectile {
     game.sound.play(this.spec.soundId, { volume: 0.9, minIntervalMs: 30 });
   }
 
-  // Exact bum() formula from Sprites 37/40/42/44/47/49/51/53/55/58/61/66/68
   _bum(game) {
     const s = this.spec;
     game.terrain.carveExplosion(this.x, this.y, s.f6w, s.f6h, s.par1, s.par2, s.par3);
@@ -82,7 +94,7 @@ export class Projectile {
         } else {
           damg = Math.round(s.f6w / ((vzd / 2 + 1) / s.par5));
         }
-        tank.damage(damg, this.owner, false);
+        tank.damage(damg, this.owner, false, game);
       }
     }
   }
@@ -111,32 +123,38 @@ export class Projectile {
     }
   }
 
-  // Shower (5 missile_funky) and Hot shower (7 bnuke_c) mid-air split at t == 3.0
+  // Shower (5 missile_funky) and Hot shower (7 bnuke_c) auto-split cleanly just past arc apex
   _spawnShowerSubs(game, count, subKey) {
+    this.hasSplit = true;
     this.expectedSubs = count;
     this.subDone = new Array(count).fill(false);
     const half = Math.floor(count / 2); // 2 for Shower(5), 3 for Hot shower(7)
+    const curVy = this.voy - this.g * this.t;
+    const spreadStep = count >= 7 ? 3.8 : 4.2;
+
+    game.sound.play(SOUNDS.SMALL_EXPLODE, { volume: 0.45, minIntervalMs: 30 });
+
     for (let i = 0; i < count; i++) {
+      const offset = -half + i;
       const sub = new Projectile({
         spec: SUB_WEAPONS[subKey],
         owner: this.owner,
         isSub: true,
         subIndex: i,
         parentProj: this,
-        x: this.x0 + game.terrain.vitr / 7,
-        y: this.y0,
+        x: this.x,
+        y: this.y,
         parentRot: this.parentRot,
         vo: this.vo,
-        vox: this.vox,
-        voy: this.voy,
-        t: this.t,
-        inc: -half + i,
+        vox: this.vox + offset * spreadStep,
+        voy: curVy + Math.abs(offset) * 0.5,
+        t: 0,
+        inc: 0,
       });
-      sub.x = this.x;
-      sub.y = this.y;
       sub.hit = false;
       game.projectiles.push(sub);
     }
+    this.waitingForSubs = true;
   }
 
   _finish(game) {
@@ -152,7 +170,7 @@ export class Projectile {
   tick(game) {
     if (this.done) return;
 
-    // Waiting for sub-munitions to finish (Volcano / Shower / Hot shower frames 12..14)
+    // Waiting for sub-munitions to finish
     if (this.waitingForSubs) {
       const allDone = this.endEarly || this.subDone.every(Boolean);
       if (allDone) {
@@ -173,7 +191,6 @@ export class Projectile {
       if (this.frame >= 12) {
         if (this.spec.kind === 'funky' || this.spec.kind === 'mirv' || this.spec.kind === 'death') {
           if (this.expectedSubs === 0) {
-            // Exploded before t==3.0 split -> no sub-munitions spawned
             this.endEarly = true;
           }
           this.waitingForSubs = true;
@@ -206,13 +223,12 @@ export class Projectile {
     for (const tank of game.tanks) {
       if (!tank.data.live || tank.data.energy <= 0) continue;
       if (this.noWind) {
-        // Air strike amissile hits any tank/shield directly
         if (tank.hitTestProjectile(this.x, this.y, 1.5, 1.5, true)) {
           this._startExplosion(game);
           return;
         }
       } else {
-        if (tank.tankNumber !== this.owner.tankNumber) {
+        if (!this.owner || tank.tankNumber !== this.owner.tankNumber) {
           if (tank.hitTestProjectile(this.x, this.y, 1.5, 1.5, true)) {
             this._startExplosion(game);
             return;
@@ -250,19 +266,25 @@ export class Projectile {
       return;
     }
 
-    // Shower & Hot shower mid-air split at exactly t == 3.0
-    if ((this.spec.kind === 'mirv' || this.spec.kind === 'death') && Math.round(this.t * 10) / 10 === 3) {
+    // Shower & Hot shower auto-split just past arc apex (reliable at any range)
+    if (
+      !this.hasSplit &&
+      (this.spec.kind === 'mirv' || this.spec.kind === 'death') &&
+      this.t >= 0.6 &&
+      (this.voy - this.g * this.t) <= -2.5
+    ) {
       if (this.spec.kind === 'mirv') {
         this._spawnShowerSubs(game, 5, 'missile_funky');
       } else {
         this._spawnShowerSubs(game, 7, 'bnuke_c');
       }
+      return;
     }
 
     this.t += this.tStep;
   }
 
-  // Exact V1 (downhill) and V2 (uphill) roller mechanics from Sprites 56-63
+  // Smoothed 3-column V1 (downhill) and V2 (uphill) roller mechanics
   _tickRoller(game) {
     if (this.first) {
       this.x = this.x0 + this.vox * this.t;
@@ -276,68 +298,64 @@ export class Projectile {
     }
 
     if (this.second) {
-      const lastx = Math.round(this.x);
       const ix = Math.round(this.x);
-      if (ix <= 1 || ix >= STAGE_W - 2) {
+      if (ix <= 2 || ix >= STAGE_W - 3) {
         this._finish(game);
         return;
       }
-      const cury = game.terrain.topY(ix);
-      const curly = game.terrain.topY(ix - 1);
-      const curpy = game.terrain.topY(ix + 1);
+      this.rollSteps++;
+      if (this.rollSteps > 260) {
+        this._startExplosion(game);
+        return;
+      }
+
+      const terrain = game.terrain;
+      const cury = terrain.topY(ix);
       this.y = cury;
+
+      const curAvg = rollerAvgTopY(terrain, ix);
+      const leftAvg = rollerAvgTopY(terrain, ix - 2);
+      const rightAvg = rollerAvgTopY(terrain, ix + 2);
 
       if (this.rollStart) {
         if (!this.uphill) {
-          // V1 (broller/roller/hroller): rolls DOWNHILL (larger Y = lower)
-          // If both neighbors are higher (curly < cury && curpy < cury), explode in valley
-          if (curly < cury && curpy < cury) {
+          // V1: rolls DOWNHILL (larger Y = lower). Explode in valley if both sides rise.
+          if (leftAvg < curAvg - 1.5 && rightAvg < curAvg - 1.5) {
             this._startExplosion(game);
             return;
           }
-          if (!(curly < cury)) {
+          if (leftAvg >= rightAvg) {
             this.smer = 'left';
-          } else if (!(curpy < cury)) {
+          } else {
             this.smer = 'right';
           }
         } else {
-          // V2 (broller2/roller2/hroller2): rolls UPHILL (smaller Y = higher)
-          // If both neighbors are lower (cury < curly && cury < curpy), explode on peak
-          if (cury < curly && cury < curpy) {
+          // V2: rolls UPHILL (smaller Y = higher). Explode on peak if both sides drop.
+          if (leftAvg > curAvg + 1.5 && rightAvg > curAvg + 1.5) {
             this._startExplosion(game);
             return;
           }
-          if (!(curly < cury)) {
-            this.smer = 'right';
-          } else if (!(curpy < cury)) {
+          if (leftAvg <= rightAvg) {
             this.smer = 'left';
+          } else {
+            this.smer = 'right';
           }
         }
         this.rollStart = false;
       }
 
-      if (this.smer === 'left') {
-        const ny = game.terrain.topY(ix - 1);
-        const canContinue = this.uphill ? !(cury < ny) : !(ny < cury);
-        if (canContinue) {
-          this.x -= 1;
-        } else {
-          this._startExplosion(game);
-          return;
-        }
-      } else if (this.smer === 'right') {
-        const ny = game.terrain.topY(ix + 1);
-        const canContinue = this.uphill ? !(cury < ny) : !(ny < cury);
-        if (canContinue) {
-          this.x += 1;
-        } else {
-          this._startExplosion(game);
-          return;
-        }
-      }
+      const dir = this.smer === 'left' ? -1 : 1;
+      const nextAvg = rollerAvgTopY(terrain, ix + dir * 2);
+      // Tolerate tiny <= 2px terrain roughness while rolling smoothly
+      const canContinue = this.uphill
+        ? nextAvg <= curAvg + 2.0
+        : nextAvg >= curAvg - 2.0;
 
-      if (Math.round(lastx) === Math.round(this.x)) {
-        this.smer = this.owner && this.owner.x < this.x ? 'right' : 'left';
+      if (canContinue) {
+        this.x += dir;
+      } else {
+        this._startExplosion(game);
+        return;
       }
     }
   }
@@ -356,15 +374,43 @@ export class Projectile {
   }
 }
 
-// Air strike controller (Sprite 64/65): wait for mouse click, then drop 5 amissiles
+// Spawn the 5 air-strike bombs for a matured pending strike
+export function spawnAirStrikeBombs(game, strike) {
+  const owner = game.tanks[(strike.ownerNum || 1) - 1] || null;
+  game.sound.play(SOUNDS.NUKE_EXPLODE, { volume: 0.7, minIntervalMs: 30 });
+  for (let i = 0; i < 5; i++) {
+    const startX = strike.uhel === 0
+      ? (strike.targetX - 120 + i * 20)
+      : (strike.targetX + 120 - i * 20);
+    const sub = new Projectile({
+      spec: SUB_WEAPONS.amissile,
+      owner,
+      isSub: true,
+      subIndex: i,
+      parentProj: null,
+      x: startX,
+      y: -50,
+      uhel: strike.uhel,
+      parentRot: strike.uhel === 0 ? 0 : 180,
+      vo: 10,
+      t: 0,
+      tStep: 0.12,
+      noWind: true,
+    });
+    sub.hit = false;
+    game.projectiles.push(sub);
+  }
+  game.triggerTest();
+}
+
+// Air strike controller: wait for target click, then plant a 1-turn delayed warning flare
 export class AirStrikeController {
   constructor(owner) {
     this.owner = owner;
     this.launched = false;
-    this.uhel = 0; // 0 = flying right (cursor xscale=+1), 180 = flying left (xscale=-1)
+    this.uhel = 0; // 0 = flying right, 180 = flying left
     this.cursorX = 275;
     this.cursorY = 120;
-    this.subDone = [false, false, false, false, false];
     this.done = false;
   }
 
@@ -376,38 +422,25 @@ export class AirStrikeController {
   launch(game, targetX) {
     if (this.launched) return;
     this.launched = true;
-    game.sound.play(SOUNDS.NUKE_EXPLODE, { volume: 0.65, minIntervalMs: 30 });
-    for (let i = 0; i < 5; i++) {
-      const startX = this.uhel === 0
-        ? (targetX - 120 + i * 20)
-        : (targetX + 120 - i * 20);
-      const sub = new Projectile({
-        spec: SUB_WEAPONS.amissile,
-        owner: this.owner,
-        isSub: true,
-        subIndex: i,
-        parentProj: this,
-        x: startX,
-        y: -50,
-        uhel: this.uhel,
-        parentRot: this.uhel === 0 ? 0 : 180,
-        vo: 10,
-        t: 0,
-        tStep: 0.12,
-        noWind: true,
-      });
-      sub.hit = false;
-      game.projectiles.push(sub);
-    }
+    const clampedX = Math.max(20, Math.min(STAGE_W - 20, Math.round(targetX)));
+    game.sound.play(SOUNDS.UI_CLICK, { volume: 0.85 });
+    game.pendingStrikes.push({
+      ownerNum: this.owner?.tankNumber || 1,
+      ownerName: this.owner?.data?.name || 'Air Strike',
+      ownerCol: this.owner?.data?.col ?? 0xF02400,
+      targetX: clampedX,
+      uhel: this.uhel,
+      turnsLeft: 1,
+      pulse: 0,
+    });
+    game.showToast?.('AIR STRIKE FLARE! Drops after next turn!', '#ff6b6b', 65);
+    this.done = true;
+    game.shotFlying = false;
+    game.triggerTest();
   }
 
-  tick(game) {
-    if (this.done || !this.launched) return;
-    if (this.subDone.every(Boolean)) {
-      this.done = true;
-      game.shotFlying = false;
-      game.triggerTest();
-    }
+  tick() {
+    // Completes immediately upon planting flare; bombs drop via game.pendingStrikes
   }
 
   render(ctx, renderer) {
@@ -420,7 +453,7 @@ export class AirStrikeController {
   }
 }
 
-// Teleport animation controller (Sprite 305: 48 frames)
+// Teleport animation controller (48 frames)
 export class TeleportController {
   constructor(tank) {
     this.tank = tank;
@@ -461,6 +494,7 @@ export class TeleportController {
       this.tank.x = this.x;
       this.tank.y = this.y;
       this.tank.fall = 0;
+      this.tank.fallStartY = null;
     } else if (this.frame >= 48) {
       this.done = true;
       game.triggerTest();

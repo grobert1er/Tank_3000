@@ -72,6 +72,9 @@ class Room:
         self.code = code
         self.host_id = host.id
         self.krajina = 0  # 0=Random, 1=Mountains, 2=Forest, 3=Desert
+        self.preset = "balanced"  # "balanced" | "classic"
+        self.turn_timer = 0       # 0 | 20 | 30
+        self.loaded_save: dict | None = None
         self.in_match = False
         self.round_num = 0
         self.ready_clients: set[str] = set()
@@ -92,10 +95,26 @@ class Room:
         return 0
 
     def serialize_lobby(self, viewer_id: str) -> dict:
+        saved = self.loaded_save
         return {
             "type": "lobby_state",
             "code": self.code,
             "krajina": self.krajina,
+            "preset": self.preset,
+            "turnTimer": self.turn_timer,
+            "loadedSaveInfo": (
+                {
+                    "label": saved.get("label") or f"Round {saved.get('gameRound', 1)}",
+                    "round": saved.get("gameRound", 1),
+                    "scene": saved.get("scene", "battle"),
+                    "players": [
+                        {"name": p.get("name", "Player"), "score": p.get("total_score", 0)}
+                        for p in (saved.get("playerData") or [])
+                    ],
+                }
+                if saved
+                else None
+            ),
             "inMatch": self.in_match,
             "isHost": viewer_id == self.host_id,
             "mySlot": self.slot_of(viewer_id),
@@ -166,14 +185,22 @@ class TankServer:
                 return
 
             client.name = str(msg.get("name") or f"Player {len(room.slots)+1}").strip()[:14] or "Player"
-            # Try taking an open AI slot or append a new slot up to 5
             placed = False
-            if len(room.slots) < 5:
+            if room.loaded_save:
+                for s in room.slots:
+                    if s["kind"] == "ai" and s.get("want_human"):
+                        s["kind"] = "human"
+                        s["client_id"] = client.id
+                        s["name"] = client.name
+                        s["want_human"] = False
+                        placed = True
+                        break
+            if not placed and not room.loaded_save and len(room.slots) < 5:
                 used_cols = {s["col"] for s in room.slots}
                 pick_col = next((c for c in DEFAULT_COLORS if c not in used_cols), DEFAULT_COLORS[len(room.slots) % 6])
                 room.slots.append({"kind": "human", "client_id": client.id, "name": client.name, "col": pick_col, "dif": "normal"})
                 placed = True
-            else:
+            elif not placed:
                 for s in room.slots:
                     if s["kind"] == "ai":
                         s["kind"] = "human"
@@ -219,7 +246,48 @@ class TankServer:
                 k = int(msg.get("krajina", 0))
                 if k in (0, 1, 2, 3):
                     room.krajina = k
-            elif action == "add_bot" and len(room.slots) < 5:
+            elif action == "set_preset":
+                room.preset = "classic" if msg.get("preset") == "classic" else "balanced"
+            elif action == "set_turn_timer":
+                sec = int(msg.get("turnTimer", 0))
+                if sec in (0, 20, 30):
+                    room.turn_timer = sec
+            elif action == "set_loaded_save":
+                save = msg.get("save")
+                if isinstance(save, dict) and isinstance(save.get("playerData"), list) and 2 <= len(save["playerData"]) <= 5:
+                    connected_humans = [s for s in room.slots if s["kind"] == "human"]
+                    new_slots = [
+                        {
+                            "kind": "ai",
+                            "client_id": None,
+                            "name": pd.get("name") or "Player",
+                            "col": pd.get("col", DEFAULT_COLORS[0]),
+                            "dif": pd.get("dif", "normal"),
+                            "want_human": pd.get("type") == "tank",
+                        }
+                        for pd in save["playerData"]
+                    ]
+                    placed_indices: set[int] = set()
+                    for h in connected_humans:
+                        t_idx = next((i for i, s in enumerate(new_slots) if i not in placed_indices and s["want_human"]), -1)
+                        if t_idx < 0:
+                            t_idx = next((i for i in range(len(new_slots)) if i not in placed_indices), -1)
+                        if t_idx >= 0:
+                            placed_indices.add(t_idx)
+                            new_slots[t_idx]["kind"] = "human"
+                            new_slots[t_idx]["client_id"] = h["client_id"]
+                            new_slots[t_idx]["want_human"] = False
+                    room.slots = new_slots
+                    room.loaded_save = save
+                    room.krajina = int(save.get("krajinaSetting", 0))
+                    room.preset = "classic" if save.get("balancePreset") == "classic" else "balanced"
+                    tt = int(save.get("turnTimerSec", 0))
+                    room.turn_timer = tt if tt in (0, 20, 30) else 0
+            elif action == "clear_loaded_save":
+                room.loaded_save = None
+                for s in room.slots:
+                    s.pop("want_human", None)
+            elif action == "add_bot" and not room.loaded_save and len(room.slots) < 5:
                 used_cols = {s["col"] for s in room.slots}
                 pick_col = next((c for c in DEFAULT_COLORS if c not in used_cols), DEFAULT_COLORS[len(room.slots) % 6])
                 room.slots.append({
@@ -229,7 +297,7 @@ class TankServer:
                     "col": pick_col,
                     "dif": "normal",
                 })
-            elif action == "remove_slot":
+            elif action == "remove_slot" and not room.loaded_save:
                 idx = int(msg.get("index", -1))
                 if 0 <= idx < len(room.slots) and len(room.slots) > 2 and room.slots[idx]["kind"] == "ai":
                     room.slots.pop(idx)
@@ -256,7 +324,9 @@ class TankServer:
                 await client.send_json({"type": "error", "message": "Need at least 2 players to start."})
                 return
             room.in_match = True
-            room.round_num = 1
+            saved_state = room.loaded_save
+            room.round_num = max(1, int(saved_state.get("gameRound", 1))) if saved_state else 1
+            room.loaded_save = None
             room.ready_clients.clear()
             seed = random.randint(1, 0x7FFFFFFF)
             players = [
@@ -274,6 +344,9 @@ class TankServer:
                     "code": room.code,
                     "seed": seed,
                     "krajina": room.krajina,
+                    "preset": room.preset,
+                    "turnTimer": room.turn_timer,
+                    "savedState": saved_state,
                     "players": players,
                     "mySlot": room.slot_of(cid),
                     "isHost": cid == room.host_id,
