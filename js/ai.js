@@ -481,7 +481,7 @@ function aiUseDefensiveSpecials(tank, game, prof) {
 
   // 3. Activate an owned Shield if unshielded and threatened
   if (!tank.shActive && pd.energy <= pd.max_energy * prof.shieldHpThresh) {
-    if (game.rng.nextFloat() < prof.shieldChance) {
+    if ((game.aiRng || game.rng).nextFloat() < prof.shieldChance) {
       // Higher difficulties prefer stronger shields; lower difficulties start with weaker shields
       const tiers = prof.shopMaxTier >= 4 ? [4, 3, 2, 1] : prof.shopMaxTier >= 3 ? [3, 2, 1, 4] : [1, 2, 3, 4];
       for (const tier of tiers) {
@@ -497,7 +497,7 @@ function aiUseDefensiveSpecials(tank, game, prof) {
 
 function aiPickWeaponAndPlan(tank, target, game, prof) {
   const guns = tank.data.guns;
-  const rng = game.rng;
+  const rng = game.aiRng || game.rng;
 
   // Solve primary direct/arc ballistic shot first
   const baseSol = solveBallisticShot(tank, target, game, {
@@ -619,7 +619,7 @@ export function aiBuyInShop(slot, game) {
   const pd = game.playerData[slot - 1];
   if (!pd || pd.type !== 'ai') return;
   const prof = getProfile(pd.dif);
-  const rng = game.rng;
+  const rng = game.aiRng || game.rng;
 
   const startingCash = pd.score;
   const minReserve = Math.round(startingCash * (1 - prof.shopSpendRatio));
@@ -822,8 +822,9 @@ export function tickAI(tank, game) {
 
     // Apply difficulty scatter (tightens on consecutive turns against same target)
     const decay = Math.pow(prof.followUpDecay, tank.aiConsecShots || 0);
-    const rotErr = (game.rng.nextFloat() * 2 - 1) * prof.rotScatter * decay;
-    const powErr = (game.rng.nextFloat() * 2 - 1) * prof.powScatter * decay;
+    const aiRng = game.aiRng || game.rng;
+    const rotErr = (aiRng.nextFloat() * 2 - 1) * prof.rotScatter * decay;
+    const powErr = (aiRng.nextFloat() * 2 - 1) * prof.powScatter * decay;
     const maxPow = Math.max(1, Math.min(100, Math.floor(tank.data.energy)));
 
     tank.pRotace = Math.max(1, Math.min(179, plan.sol.rot + rotErr));

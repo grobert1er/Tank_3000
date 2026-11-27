@@ -293,6 +293,15 @@ async function boot() {
       game.startOnlineNextRound(seed);
       statusPill.textContent = `Online Room ${net.roomCode || ''} · Round ${round}`;
     },
+    onPeerRejoined: ({ sendSnapshot }) => {
+      if (game && game.mode === 'online' && game.isHost) {
+        sendSnapshot({
+          type: 'state_sync',
+          forceImmediate: true,
+          ...game.buildSyncSnapshot(),
+        });
+      }
+    },
     onPeerLeft: ({ slot, isHost }) => {
       stepSimulation(performance.now());
       if (game && game.mode === 'online') {

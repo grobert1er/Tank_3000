@@ -744,6 +744,12 @@ export class NetworkClient {
             mySlot: this._p2pSlotOf(oldCid),
             isHost: false,
           });
+          // Notify host app so it can immediately push an authoritative state snapshot to this peer
+          this.handlers.onPeerRejoined?.({
+            sendSnapshot: (payload) => {
+              this._p2pSendTo(oldCid, { type: 'action', payload });
+            },
+          });
         }
         return;
       }
