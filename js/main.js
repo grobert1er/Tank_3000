@@ -24,6 +24,7 @@ async function boot() {
   const btnFullscreen = document.getElementById('btn-fullscreen');
   const btnControls = document.getElementById('btn-controls');
   const statusPill = document.getElementById('status-pill');
+  const btnFastForward = document.getElementById('btn-fast-forward');
   const btnAwayBot = document.getElementById('btn-away-bot');
   const localRulesBar = document.getElementById('local-rules-bar');
   const localPresetEl = document.getElementById('local-preset');
@@ -305,6 +306,30 @@ async function boot() {
   btnAwayBot.addEventListener('click', () => {
     const slotNum = Number(btnAwayBot.dataset.slot || 0);
     if (slotNum > 0) net.replaceAwayWithBot(slotNum);
+  });
+
+  let _lastFfVis = null;
+  let _lastFfOn = null;
+  function refreshFastForwardButton() {
+    if (!game) return;
+    const canShow = game.isBotsOnlyAlive() && (game.mode === 'local' || game.isHost);
+    const isOn = Boolean(game.fastForward && canShow);
+    if (canShow !== _lastFfVis) {
+      _lastFfVis = canShow;
+      btnFastForward.hidden = !canShow;
+    }
+    if (isOn !== _lastFfOn) {
+      _lastFfOn = isOn;
+      btnFastForward.textContent = isOn ? '⏩ 4× Speed ON' : '⏩ Skip Bots (4×)';
+      btnFastForward.classList.toggle('accent', isOn);
+      btnFastForward.classList.toggle('warn', !isOn);
+    }
+  }
+
+  btnFastForward.addEventListener('click', () => {
+    if (!game) return;
+    game.setFastForward(!game.fastForward);
+    refreshFastForwardButton();
   });
 
   net = new NetworkClient({
@@ -912,16 +937,22 @@ async function boot() {
     if (elapsed <= 0) return;
     lastTime = now;
     const isOnline = game.mode === 'online';
+    const speedMult = game.getSimSpeed(); // 4 when bots-only fast-forward is active, else 1
     // In local mode, clamp dt so backgrounding pauses play cleanly.
     // In online mode, step all missed 25Hz ticks so peers stay in deterministic lockstep.
     const maxDt = isOnline ? 30000 : 120;
-    const maxSteps = isOnline ? 750 : 5;
-    acc += Math.min(maxDt, elapsed);
+    const maxSteps = isOnline ? 750 * speedMult : 5 * speedMult;
+    acc += Math.min(maxDt, elapsed) * speedMult;
     let steps = 0;
     while (acc >= FRAME_MS && steps < maxSteps) {
       game.tick();
       acc -= FRAME_MS;
       steps++;
+      // Drop smoothly back to 1x the instant the bot-only battle finishes
+      if (speedMult > 1 && game.getSimSpeed() === 1) {
+        acc = 0;
+        break;
+      }
     }
     if (acc >= FRAME_MS * maxSteps) acc = 0;
   };
@@ -969,6 +1000,7 @@ async function boot() {
 
   function loop(now) {
     stepSimulation(now);
+    refreshFastForwardButton();
 
     // HiDPI crisp vector render
     const dpr = window.devicePixelRatio || 1;

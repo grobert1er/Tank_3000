@@ -40,6 +40,7 @@ export class TankGame {
     this.pendingStrikes = [];
     this.bannerToast = null; // { text, color, frames }
     this._roundPayoutAwarded = false;
+    this.fastForward = false; // 4x simulation speed when only AI bots remain alive
 
     // Scene state: 'menu1' | 'menu2' | 'loading' | 'battle' | 'round_end' | 'shop'
     this.scene = 'menu1';
@@ -141,10 +142,42 @@ export class TankGame {
     this.bannerToast = null;
     this.roundTurns = 0;
     this.turnTicksLeft = 0;
+    this.fastForward = false;
     this.blik = null;
     this.shieldsMenuOpen = false;
     this.cursorHidden = false;
     this._notifyStatus();
+  }
+
+  // True during battle when >= 2 tanks are alive and ALL surviving tanks are AI bots
+  isBotsOnlyAlive() {
+    if (this.scene !== 'battle' || this.aliveCount < 2) return false;
+    let aiAlive = 0;
+    for (const t of this.tanks) {
+      if (t.data.live && t.data.energy > 0 && !t.dead) {
+        if (t.type !== 'ai') return false;
+        aiAlive++;
+      }
+    }
+    return aiAlive >= 2;
+  }
+
+  getSimSpeed() {
+    return this.fastForward && this.isBotsOnlyAlive() ? 4 : 1;
+  }
+
+  setFastForward(enabled, fromRemote = false) {
+    if (!fromRemote && this.mode === 'online' && !this.isHost) return false;
+    const next = Boolean(enabled) && this.isBotsOnlyAlive();
+    if (this.fastForward === next) return this.fastForward;
+    this.fastForward = next;
+    if (!fromRemote && this.mode === 'online' && this.isHost) {
+      this.cb.onOnlineAction?.({
+        type: 'fast_forward',
+        enabled: this.fastForward,
+      });
+    }
+    return this.fastForward;
   }
 
   setBalancePreset(preset) {
@@ -295,6 +328,7 @@ export class TankGame {
     this.airStrike = null;
     this.teleport = null;
     this.pendingStrikes = [];
+    this.fastForward = false;
     this.blik = null;
     this.shieldsMenuOpen = false;
     this.cursorHidden = false;
@@ -325,6 +359,7 @@ export class TankGame {
     this._roundPayoutAwarded = false;
     this.roundTurns = 0;
     this.turnTicksLeft = 0;
+    this.fastForward = false;
 
     // Fairer spawns: stay well away from screen edges (x = 45..505)
     const minSep = 320 / this.playerCount;
@@ -804,6 +839,7 @@ export class TankGame {
       turnTimerSec: this.turnTimerSec,
       turnTicksLeft: this.turnTicksLeft,
       roundTurns: this.roundTurns,
+      fastForward: this.fastForward,
       vitr: this.terrain.vitr,
       rngState: this.rng.getState(),
       turnOrder: this.turnOrder.map((t) => t.tankNumber),
@@ -927,6 +963,7 @@ export class TankGame {
     this.roundEndPending = false;
     this.roundTransitioning = false;
     this._roundPayoutAwarded = false;
+    this.fastForward = false;
     this.cursorHidden = false;
     this.pendingStrikes = Array.isArray(save.pendingStrikes)
       ? save.pendingStrikes.map((s) => ({ ...s }))
@@ -1030,6 +1067,7 @@ export class TankGame {
     if (snap.turnTimerSec !== undefined) this.setTurnTimer(snap.turnTimerSec);
     if (snap.turnTicksLeft !== undefined) this.turnTicksLeft = snap.turnTicksLeft;
     if (snap.roundTurns !== undefined) this.roundTurns = snap.roundTurns;
+    if (snap.fastForward !== undefined) this.fastForward = Boolean(snap.fastForward);
     if (Array.isArray(snap.pendingStrikes)) {
       this.pendingStrikes = snap.pendingStrikes.map((s) => ({ ...s }));
     }
@@ -1217,6 +1255,11 @@ export class TankGame {
       return;
     }
 
+    if (msg.type === 'fast_forward') {
+      this.setFastForward(Boolean(msg.enabled), true);
+      return;
+    }
+
     if (msg.type === 'strike_drop') {
       this._catchUpForRemote(0);
       if (this.scene === 'battle' && msg.strike) {
@@ -1372,6 +1415,7 @@ export class TankGame {
     this.airStrike = null;
     this.teleport = null;
     this.pendingStrikes = [];
+    this.fastForward = false;
     this.blik = null;
     this.terrain.vitr = 0;
 
@@ -1497,6 +1541,9 @@ export class TankGame {
     }
 
     if (this.scene === 'battle') {
+      if (this.fastForward && !this.isBotsOnlyAlive()) {
+        this.fastForward = false;
+      }
       this.terrain.tick();
 
       // Turn blink arrow (Sprite 225: 35 frames)
@@ -2588,7 +2635,7 @@ export class TankGame {
 
     ctx.restore();
 
-    // Subtle battle status banners (Sudden Death, Turn Timer, Online Wait, Event Toast)
+    // Subtle battle status banners (Sudden Death, 4x Bot Skip, Turn Timer, Online Wait, Event Toast)
     let bannerY = 53;
     const dmgMult = this.getDamageMultiplier();
     if (dmgMult > 1) {
@@ -2603,6 +2650,22 @@ export class TankGame {
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(`SUDDEN DEATH · ${dmgMult.toFixed(1)}x DMG`, 77, bannerY + 8);
+      ctx.restore();
+    }
+
+    if (this.fastForward && this.isBotsOnlyAlive()) {
+      const ffY = dmgMult > 1 ? bannerY + 19 : bannerY;
+      ctx.save();
+      ctx.fillStyle = 'rgba(38, 87, 168, 0.88)';
+      ctx.fillRect(8, ffY, 114, 16);
+      ctx.strokeStyle = '#7db0ff';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(8, ffY, 114, 16);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 9px Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('>> 4x BOT BATTLE', 65, ffY + 8);
       ctx.restore();
     }
 
