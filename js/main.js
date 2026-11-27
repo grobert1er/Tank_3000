@@ -23,6 +23,7 @@ async function boot() {
   const btnFullscreen = document.getElementById('btn-fullscreen');
   const btnControls = document.getElementById('btn-controls');
   const statusPill = document.getElementById('status-pill');
+  const btnAwayBot = document.getElementById('btn-away-bot');
 
   // Modals
   const controlsModal = document.getElementById('controls-modal');
@@ -222,10 +223,21 @@ async function boot() {
           rightEl.appendChild(rm);
         }
       } else {
+        const isAway = s.connected === false;
         const tag = document.createElement('span');
-        tag.className = 'slot-status' + (s.connected === false ? ' reconnecting' : '');
-        tag.textContent = s.connected === false ? 'Reconnecting...' : 'Online';
+        tag.className = 'slot-status' + (isAway ? ' reconnecting' : '');
+        tag.textContent = isAway ? 'Away' : 'Online';
         rightEl.appendChild(tag);
+
+        if (isAway && lobby.isHost && !s.isHost && lobby.slots.length > 2) {
+          const rm = document.createElement('button');
+          rm.type = 'button';
+          rm.className = 'btn-mini danger';
+          rm.textContent = '×';
+          rm.title = 'Remove away player';
+          rm.addEventListener('click', () => net.hostConfig('remove_slot', { index: idx }));
+          rightEl.appendChild(rm);
+        }
       }
 
       row.append(badge, nameNode, swatches, rightEl);
@@ -241,12 +253,33 @@ async function boot() {
   }
 
   let stepSimulation = () => {};
+  let currentAwaySlots = [];
+
+  function refreshAwayButton() {
+    if (game && game.mode === 'online' && game.isHost && currentAwaySlots.length > 0) {
+      const target = currentAwaySlots[0];
+      btnAwayBot.textContent = `${target.name} away → Bot`;
+      btnAwayBot.dataset.slot = String(target.slot);
+      btnAwayBot.hidden = false;
+    } else {
+      btnAwayBot.hidden = true;
+    }
+  }
+
+  btnAwayBot.addEventListener('click', () => {
+    const slotNum = Number(btnAwayBot.dataset.slot || 0);
+    if (slotNum > 0) net.replaceAwayWithBot(slotNum);
+  });
 
   net = new NetworkClient({
     onConnectionChange: (ok) => {
       if (!ok && game && game.mode === 'online') {
-        statusPill.textContent = 'Disconnected from room';
+        statusPill.textContent = `Reconnecting to ${net.roomCode || 'room'}...`;
       }
+    },
+    onAwaySlotsChange: (awayList) => {
+      currentAwaySlots = awayList || [];
+      refreshAwayButton();
     },
     onReconnecting: (isReconnecting) => {
       if (isReconnecting) {
@@ -264,6 +297,8 @@ async function boot() {
     onLeftRoom: () => {
       lobbyRoom.hidden = true;
       lobbyEntry.hidden = false;
+      currentAwaySlots = [];
+      refreshAwayButton();
       statusPill.textContent = 'Local Mode';
     },
     onMatchStart: (msg) => {
@@ -275,6 +310,7 @@ async function boot() {
         mySlot: msg.mySlot,
         isHost: msg.isHost,
       });
+      refreshAwayButton();
       statusPill.textContent = `Online Room ${msg.code} · Round 1`;
     },
     onRemoteAim: (payload) => {
@@ -541,19 +577,44 @@ async function boot() {
     if (acc >= FRAME_MS * maxSteps) acc = 0;
   };
 
-  // Background ticker keeps online simulation & host bots advancing while tab is hidden
-  setInterval(() => {
+  // Unthrottled Web Worker ticker keeps online simulation (25Hz), host bots,
+  // and WebRTC heartbeats running indefinitely even while tab is in the background.
+  const onBackgroundTick = () => {
+    net.backgroundHeartbeatTick();
     if (document.hidden && game.mode === 'online') {
       stepSimulation(performance.now());
     }
-  }, 200);
+  };
+  try {
+    const workerSrc = `setInterval(() => postMessage(1), ${Math.round(FRAME_MS)});`;
+    const blob = new Blob([workerSrc], { type: 'application/javascript' });
+    const workerUrl = URL.createObjectURL(blob);
+    const bgWorker = new Worker(workerUrl);
+    URL.revokeObjectURL(workerUrl);
+    bgWorker.onmessage = onBackgroundTick;
+  } catch {
+    setInterval(onBackgroundTick, 100);
+  }
 
-  document.addEventListener('visibilitychange', () => {
+  const onTabResume = () => {
     if (!document.hidden) {
       stepSimulation(performance.now());
       net.handleVisibilityResume();
+      refreshAwayButton();
+    }
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      onTabResume();
     } else {
       game.clearKeys();
+    }
+  });
+  window.addEventListener('focus', onTabResume);
+  window.addEventListener('online', onTabResume);
+  window.addEventListener('pagehide', (ev) => {
+    if (!ev.persisted) {
+      net.notifyTabClosing();
     }
   });
 

@@ -13,8 +13,7 @@ const ICE_SERVERS = [
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun.cloudflare.com:3478' },
 ];
-const RECONNECT_GRACE_MS = 18000; // Host keeps disconnected peer's slot reserved for 18s (tab switch / mobile sleep)
-const HEARTBEAT_MS = 5000;
+const HEARTBEAT_MS = 4000;
 
 function genRoomCode() {
   let out = '';
@@ -56,24 +55,94 @@ export class NetworkClient {
     this._reconnectTimer = null;
     this._reconnectAttempt = 0;
     this._heartbeatTimer = null;
+    this._lastHeartbeatAt = 0;
     this._pendingGuestMsgs = [];  // buffer outbound messages briefly during reconnect
+    this._releaseLock = null;     // Web Locks API hold prevents Chrome/Edge background tab freezing
   }
 
   setTransport(mode) {
     this.transport = mode === 'ws' ? 'ws' : 'p2p';
   }
 
-  // Called when browser tab becomes visible again after backgrounding
+  _acquireKeepAliveLock() {
+    if (this._releaseLock || !navigator?.locks?.request) return;
+    try {
+      navigator.locks.request(`tank3000-keepalive-${this._sessionId}`, () => new Promise((resolve) => {
+        this._releaseLock = resolve;
+      })).catch(() => {});
+    } catch {}
+  }
+
+  _releaseKeepAliveLock() {
+    if (this._releaseLock) {
+      try { this._releaseLock(); } catch {}
+      this._releaseLock = null;
+    }
+  }
+
+  // Called from an unthrottled Web Worker every 40ms so heartbeats & signaling stay alive indefinitely in background tabs
+  backgroundHeartbeatTick() {
+    if (this.transport !== 'p2p' || this._closingP2P) return;
+    if (!this._p2pRole) return;
+    const now = Date.now();
+    if (now - this._lastHeartbeatAt < HEARTBEAT_MS) return;
+    this._lastHeartbeatAt = now;
+    this._runHeartbeatStep();
+  }
+
+  _runHeartbeatStep() {
+    if (this._closingP2P) return;
+    if (this._peer && this._peer.disconnected && !this._peer.destroyed) {
+      try { this._peer.reconnect(); } catch {}
+    }
+    if (this._p2pRole === 'host' && this._p2pRoom) {
+      for (const conn of this._p2pRoom.conns.values()) {
+        if (conn && conn.open) {
+          try { conn.send({ type: 'ping', t: Date.now() }); } catch {}
+        }
+      }
+    } else if (this._p2pRole === 'guest') {
+      if (this._hostConn && this._hostConn.open) {
+        try { this._hostConn.send({ type: 'ping', t: Date.now() }); } catch {}
+      } else if (this._guestSession && !this._reconnecting) {
+        this._attemptGuestReconnect(false);
+      }
+    }
+  }
+
+  // Called only on actual tab close / navigation (pagehide), never on tab switch
+  notifyTabClosing() {
+    if (this.transport === 'ws' && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this._sendWS({ type: 'leave_room' });
+      return;
+    }
+    if (this._p2pRole === 'guest' && this._hostConn && this._hostConn.open) {
+      try { this._hostConn.send({ type: 'leave_room' }); } catch {}
+    } else if (this._p2pRole === 'host' && this._p2pRoom) {
+      for (const conn of this._p2pRoom.conns.values()) {
+        try { if (conn.open) conn.send({ type: 'host_closed', message: 'Host closed the room.' }); } catch {}
+      }
+    }
+  }
+
+  // Host manually converts a permanently-away human slot into an AI bot (optional override)
+  replaceAwayWithBot(slotNum) {
+    if (this._p2pRole !== 'host' || !this._p2pRoom) return;
+    const slot = this._p2pRoom.slots[slotNum - 1];
+    if (!slot || slot.kind !== 'human' || slot.clientId === 'host') return;
+    if (this._p2pRoom.conns.has(slot.clientId)) return; // still connected
+    this._p2pHostFinalizeRemove(slot.clientId);
+  }
+
+  // Called when browser tab becomes visible, focused, or network comes back online
   handleVisibilityResume() {
     if (this.transport !== 'p2p' || this._closingP2P) return;
 
-    // Ensure PeerJS signaling socket reconnects if throttled/dropped in background
     if (this._peer && this._peer.disconnected && !this._peer.destroyed) {
       try { this._peer.reconnect(); } catch {}
     }
 
     if (this._p2pRole === 'host' && this._p2pRoom) {
-      // Send immediate heartbeat ping to all connected guests to wake DataChannels
       for (const conn of this._p2pRoom.conns.values()) {
         if (conn && conn.open) {
           try { conn.send({ type: 'ping', t: Date.now() }); } catch {}
@@ -83,7 +152,7 @@ export class NetworkClient {
       if (this._hostConn && this._hostConn.open) {
         try { this._hostConn.send({ type: 'ping', t: Date.now() }); } catch {}
       } else {
-        // Tab backgrounding closed the DataChannel -> reconnect immediately
+        // Reconnect immediately upon returning to the tab
         this._attemptGuestReconnect(true);
       }
     }
@@ -262,20 +331,11 @@ export class NetworkClient {
 
   _startHeartbeat() {
     this._stopHeartbeat();
+    this._acquireKeepAliveLock();
+    this._lastHeartbeatAt = Date.now();
     this._heartbeatTimer = setInterval(() => {
-      if (this._closingP2P) return;
-      if (this._peer && this._peer.disconnected && !this._peer.destroyed) {
-        try { this._peer.reconnect(); } catch {}
-      }
-      if (this._p2pRole === 'host' && this._p2pRoom) {
-        for (const conn of this._p2pRoom.conns.values()) {
-          if (conn && conn.open) {
-            try { conn.send({ type: 'ping', t: Date.now() }); } catch {}
-          }
-        }
-      } else if (this._p2pRole === 'guest' && this._hostConn && this._hostConn.open) {
-        try { this._hostConn.send({ type: 'ping', t: Date.now() }); } catch {}
-      }
+      this._lastHeartbeatAt = Date.now();
+      this._runHeartbeatStep();
     }, HEARTBEAT_MS);
   }
 
@@ -298,9 +358,11 @@ export class NetworkClient {
   _teardownP2P(notifyPeers = false) {
     this._closingP2P = true;
     this._stopHeartbeat();
+    this._releaseKeepAliveLock();
     this._clearReconnectTimer();
     this._pendingGuestMsgs = [];
     this._guestSession = null;
+    this.handlers.onAwaySlotsChange?.([]);
 
     if (this._p2pRoom) {
       for (const timer of this._p2pRoom.graceTimers.values()) {
@@ -586,23 +648,13 @@ export class NetworkClient {
       this._reconnectTimer = null;
     }
 
-    const maxAttempts = 6;
-    if (this._reconnectAttempt >= maxAttempts) {
-      const wasInMatch = Boolean(this.lobby?.inMatch);
-      this._teardownP2P(false);
-      this.roomCode = null;
-      this.lobby = null;
-      this.handlers.onConnectionChange?.(false);
-      if (!wasInMatch) {
-        this.handlers.onLeftRoom?.();
-        this.handlers.onError?.('Connection to host was lost.');
-      }
-      return;
-    }
-
+    // Never give up reconnecting while user hasn't explicitly left:
+    // gentle capped backoff while away, instant reconnect when returning to the tab.
     this._reconnecting = true;
     this.handlers.onReconnecting?.(true);
-    const delay = immediate ? 150 : (this._reconnectAttempt === 0 ? 600 : 2000);
+    const delay = immediate
+      ? 100
+      : Math.min(5000, this._reconnectAttempt === 0 ? 500 : 1200 + this._reconnectAttempt * 600);
 
     this._reconnectTimer = setTimeout(async () => {
       this._reconnectTimer = null;
@@ -646,8 +698,23 @@ export class NetworkClient {
     const room = this._p2pRoom;
     if (!room) return [];
     return room.slots
-      .filter((s) => s.kind === 'human' && (s.clientId === 'host' || room.conns.has(s.clientId)))
+      .filter((s) => s.kind === 'human' && s.clientId)
       .map((s) => s.clientId);
+  }
+
+  _p2pNotifyAwaySlots() {
+    const room = this._p2pRoom;
+    if (!room) {
+      this.handlers.onAwaySlotsChange?.([]);
+      return;
+    }
+    const away = [];
+    room.slots.forEach((s, idx) => {
+      if (s.kind === 'human' && s.clientId !== 'host' && !room.conns.has(s.clientId)) {
+        away.push({ slot: idx + 1, name: s.name });
+      }
+    });
+    this.handlers.onAwaySlotsChange?.(away);
   }
 
   _p2pSerializeLobby(viewerId) {
@@ -735,6 +802,7 @@ export class NetworkClient {
         if (isStateObj) stateOrCid.cid = oldCid;
         cid = oldCid;
         room.conns.set(oldCid, conn);
+        this._p2pNotifyAwaySlots();
         if (!room.inMatch) {
           this._p2pBroadcastLobby();
         } else {
@@ -834,8 +902,14 @@ export class NetworkClient {
         });
       } else if (action === 'remove_slot') {
         const idx = Number(msg.index ?? -1);
-        if (idx >= 0 && idx < room.slots.length && room.slots.length > 2 && room.slots[idx].kind === 'ai') {
+        const slot = room.slots[idx];
+        const canRemove =
+          slot &&
+          room.slots.length > 2 &&
+          (slot.kind === 'ai' || (slot.kind === 'human' && slot.clientId !== 'host' && !room.conns.has(slot.clientId)));
+        if (idx >= 0 && idx < room.slots.length && canRemove) {
           room.slots.splice(idx, 1);
+          this._p2pNotifyAwaySlots();
         }
       } else if (action === 'set_bot_dif') {
         const idx = Number(msg.index ?? -1);
@@ -940,26 +1014,15 @@ export class NetworkClient {
     if (!hadConn && !hasSlot) return;
 
     if (immediate) {
-      if (room.graceTimers.has(cid)) {
-        clearTimeout(room.graceTimers.get(cid));
-        room.graceTimers.delete(cid);
-      }
       this._p2pHostFinalizeRemove(cid);
       return;
     }
 
-    // Reserve slot during grace period so a guest returning from another tab seamlessly rejoins
+    // Passive disconnect (tab backgrounded / OS sleep / network blip):
+    // Keep the player's slot reserved indefinitely until they return or host manually replaces them.
+    this._p2pNotifyAwaySlots();
     if (!room.inMatch) {
-      this._p2pBroadcastLobby(); // shows "Reconnecting..." badge
-    }
-    if (!room.graceTimers.has(cid)) {
-      const timer = setTimeout(() => {
-        room.graceTimers.delete(cid);
-        if (!room.conns.has(cid)) {
-          this._p2pHostFinalizeRemove(cid);
-        }
-      }, RECONNECT_GRACE_MS);
-      room.graceTimers.set(cid, timer);
+      this._p2pBroadcastLobby(); // shows amber "Away" badge
     }
   }
 
@@ -980,6 +1043,7 @@ export class NetworkClient {
           dif: 'normal',
         });
       }
+      this._p2pNotifyAwaySlots();
       this._p2pBroadcastLobby();
     } else {
       let slotNum = 0;
@@ -992,6 +1056,7 @@ export class NetworkClient {
           break;
         }
       }
+      this._p2pNotifyAwaySlots();
       if (slotNum > 0) {
         const allIds = ['host', ...room.conns.keys()];
         for (const viewerId of allIds) {

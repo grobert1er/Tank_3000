@@ -86,6 +86,20 @@ html, body {
   border-color: #a64455;
 }
 
+.bar-btn.warn {
+  background: #5c4314;
+  border-color: #d49c2f;
+  color: #ffe299;
+}
+
+.bar-btn.warn:hover {
+  background: #73541a;
+}
+
+.bar-btn[hidden] {
+  display: none;
+}
+
 #stage-wrap {
   flex: 1;
   min-height: 0;
