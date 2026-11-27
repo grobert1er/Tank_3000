@@ -23,8 +23,44 @@ function genRoomCode() {
   return out;
 }
 
-function genSessionId() {
-  return 's' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const SESSION_STORAGE_KEY = 'tank3000_peer_session_v1';
+
+function getOrCreateSessionId() {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.sessionId === 'string' && parsed.sessionId.length >= 6) {
+        return parsed.sessionId;
+      }
+    }
+  } catch {}
+  const id = 's' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ sessionId: id }));
+  } catch {}
+  return id;
+}
+
+function saveLastRoomSession(sessionId, roomInfo) {
+  try {
+    localStorage.setItem(
+      SESSION_STORAGE_KEY,
+      JSON.stringify({ sessionId, lastRoom: roomInfo || null })
+    );
+  } catch {}
+}
+
+export function getLastRoomSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed?.lastRoom && Date.now() - (parsed.lastRoom.ts || 0) < 6 * 3600 * 1000) {
+      return parsed.lastRoom;
+    }
+  } catch {}
+  return null;
 }
 
 function randomSeed() {
@@ -49,7 +85,7 @@ export class NetworkClient {
     this._p2pRole = null;         // 'host' | 'guest' | null
     this._peerSeq = 0;
     this._closingP2P = false;
-    this._sessionId = genSessionId();
+    this._sessionId = getOrCreateSessionId();
     this._guestSession = null;    // { code, name, sessionId } for auto-reconnect
     this._reconnecting = false;
     this._reconnectTimer = null;
@@ -176,12 +212,31 @@ export class NetworkClient {
     if (!cleanCode) {
       throw new Error('Enter a 4-character room code.');
     }
+    saveLastRoomSession(this._sessionId, {
+      code: cleanCode,
+      name: cleanName,
+      transport: this.transport,
+      ts: Date.now(),
+    });
     if (this.transport === 'ws') {
       await this._connectWS();
-      this._sendWS({ type: 'join_room', code: cleanCode, name: cleanName });
+      this._sendWS({ type: 'join_room', code: cleanCode, name: cleanName, sessionId: this._sessionId });
     } else {
       await this._joinP2PRoom(cleanCode, cleanName);
     }
+  }
+
+  // Request an immediate full state snapshot from the host (or reconnect if channel dropped)
+  requestSync() {
+    if (this.transport === 'p2p' && this._p2pRole === 'guest') {
+      if (!this._hostConn || !this._hostConn.open) {
+        if (this._guestSession) {
+          this._attemptGuestReconnect(true);
+        }
+        return;
+      }
+    }
+    this._sendOut({ type: 'request_sync' });
   }
 
   leaveRoom() {
@@ -526,7 +581,7 @@ export class NetworkClient {
     this._closeWS();
     this._teardownP2P(false);
     this._closingP2P = false;
-    this._sessionId = genSessionId();
+    this._sessionId = getOrCreateSessionId();
 
     const peer = await this._openPeer(undefined);
     this._peer = peer;
@@ -795,6 +850,113 @@ export class NetworkClient {
     }
   }
 
+  // Match a returning guest to their existing/away/former-human slot during a match or lobby
+  _p2pFindRejoinSlot(room, sessId, cleanName) {
+    const lowerName = (cleanName || '').toLowerCase();
+    // 1. Exact active or away sessionId match on a human slot
+    if (sessId) {
+      const bySess = room.slots.find((s) => s.kind === 'human' && s.clientId !== 'host' && s.sessionId === sessId);
+      if (bySess) return { slot: bySess, reclaimedFromAi: false };
+    }
+    // 2. Exact originalSessionId match on a slot temporarily taken over by AI
+    if (sessId) {
+      const byOrigSess = room.slots.find((s) => s.kind === 'ai' && s.originalSessionId === sessId);
+      if (byOrigSess) return { slot: byOrigSess, reclaimedFromAi: true };
+    }
+    // 3. Disconnected (Away) human slot matching name (case-insensitive)
+    if (lowerName) {
+      const byAwayName = room.slots.find(
+        (s) => s.kind === 'human' && s.clientId !== 'host' && !room.conns.has(s.clientId) && (s.name || '').toLowerCase() === lowerName
+      );
+      if (byAwayName) return { slot: byAwayName, reclaimedFromAi: false };
+    }
+    // 4. Former human slot (currently AI) matching originalName (case-insensitive)
+    if (lowerName) {
+      const byOrigName = room.slots.find(
+        (s) => s.kind === 'ai' && s.wasHuman && (s.originalName || s.name || '').toLowerCase() === lowerName
+      );
+      if (byOrigName) return { slot: byOrigName, reclaimedFromAi: true };
+    }
+    // 5. Fallback during an active match: claim the sole disconnected human slot or sole former-human bot slot
+    if (room.inMatch) {
+      const awayHumans = room.slots.filter((s) => s.kind === 'human' && s.clientId !== 'host' && !room.conns.has(s.clientId));
+      if (awayHumans.length === 1) return { slot: awayHumans[0], reclaimedFromAi: false };
+      const formerHumans = room.slots.filter((s) => s.kind === 'ai' && s.wasHuman);
+      if (formerHumans.length === 1) return { slot: formerHumans[0], reclaimedFromAi: true };
+    }
+    return null;
+  }
+
+  _p2pCompleteRejoin(room, stateOrCid, conn, isStateObj, match, sessId, cleanName) {
+    const existing = match.slot;
+    const slotIdx = room.slots.indexOf(existing);
+    const slotNum = slotIdx + 1;
+    let cid = existing.clientId || (isStateObj ? stateOrCid.cid : stateOrCid);
+
+    if (existing.clientId && room.graceTimers.has(existing.clientId)) {
+      clearTimeout(room.graceTimers.get(existing.clientId));
+      room.graceTimers.delete(existing.clientId);
+    }
+
+    // Close any stale/old DataConnection for this slot before binding the new one
+    const prevConn = existing.clientId ? room.conns.get(existing.clientId) : null;
+    if (prevConn && prevConn !== conn) {
+      try { prevConn.close(); } catch {}
+    }
+
+    if (match.reclaimedFromAi) {
+      cid = `p${++this._peerSeq}`;
+      existing.kind = 'human';
+      existing.clientId = cid;
+      existing.sessionId = sessId || existing.originalSessionId || cid;
+      existing.wasHuman = true;
+      existing.originalSessionId = existing.sessionId;
+      existing.originalName = existing.originalName || existing.name;
+      if (cleanName && !existing.originalName) existing.name = cleanName;
+    } else if (sessId) {
+      existing.sessionId = sessId;
+      existing.originalSessionId = sessId;
+    }
+
+    if (isStateObj) stateOrCid.cid = cid;
+    room.conns.set(cid, conn);
+    this._p2pNotifyAwaySlots();
+
+    if (!room.inMatch) {
+      this._p2pBroadcastLobby();
+      return;
+    }
+
+    // If this player reclaimed a slot that was temporarily controlled by AI, restore human control on all peers
+    if (match.reclaimedFromAi) {
+      const allIds = ['host', ...room.conns.keys()];
+      for (const viewerId of allIds) {
+        this._p2pSendTo(viewerId, {
+          type: 'peer_reclaimed',
+          slot: slotNum,
+          name: existing.name,
+        });
+      }
+    }
+
+    // Tell the returning peer their slot & room so even a freshly refreshed tab enters online mode cleanly
+    this._p2pSendTo(cid, {
+      type: 'rejoined_match',
+      code: room.code,
+      mySlot: slotNum,
+      isHost: false,
+      reclaimed: match.reclaimedFromAi,
+    });
+
+    // Immediately push an authoritative full state snapshot to this returning peer
+    this.handlers.onPeerRejoined?.({
+      slot: slotNum,
+      sendSnapshot: (payload) => {
+        this._p2pSendTo(cid, { type: 'action', payload });
+      },
+    });
+  }
+
   _p2pHostHandle(stateOrCid, conn, msg) {
     const room = this._p2pRoom;
     if (!room) return;
@@ -802,55 +964,43 @@ export class NetworkClient {
     let cid = isStateObj ? stateOrCid.cid : stateOrCid;
     const mtype = msg.type;
 
-    // Seamless reconnection of a peer returning from a backgrounded tab
+    // Seamless reconnection of a peer returning from tab sleep, desync, refresh, or bot takeover
     if (mtype === 'rejoin_room' && cid !== 'host') {
       const sessId = String(msg.sessionId || '');
-      const existing = sessId ? room.slots.find((s) => s.kind === 'human' && s.sessionId === sessId) : null;
-      if (existing) {
-        const oldCid = existing.clientId;
-        if (room.graceTimers.has(oldCid)) {
-          clearTimeout(room.graceTimers.get(oldCid));
-          room.graceTimers.delete(oldCid);
-        }
-        // Rebind this new DataConnection to the preserved clientId
-        if (isStateObj) stateOrCid.cid = oldCid;
-        cid = oldCid;
-        room.conns.set(oldCid, conn);
-        this._p2pNotifyAwaySlots();
-        if (!room.inMatch) {
-          this._p2pBroadcastLobby();
-        } else {
-          this._p2pSendTo(oldCid, {
-            type: 'rejoined_match',
-            code: room.code,
-            mySlot: this._p2pSlotOf(oldCid),
-            isHost: false,
-          });
-          // Notify host app so it can immediately push an authoritative state snapshot to this peer
-          this.handlers.onPeerRejoined?.({
-            sendSnapshot: (payload) => {
-              this._p2pSendTo(oldCid, { type: 'action', payload });
-            },
-          });
-        }
+      const cleanName = String(msg.name || '').trim().slice(0, 14);
+      const match = this._p2pFindRejoinSlot(room, sessId, cleanName);
+      if (match) {
+        this._p2pCompleteRejoin(room, stateOrCid, conn, isStateObj, match, sessId, cleanName);
         return;
       }
-      // If session wasn't found and lobby is still open, fall through as a fresh join
       if (!room.inMatch) {
         this._p2pHostHandle(stateOrCid, conn, { ...msg, type: 'join_room' });
       } else {
-        try { conn?.send({ type: 'error', message: `Room '${room.code}' is already in a match.` }); } catch {}
+        try { conn?.send({ type: 'error', message: `Room '${room.code}' is already in a match (no disconnected player slot found).` }); } catch {}
       }
       return;
     }
 
     if (mtype === 'join_room' && cid !== 'host') {
+      const sessId = String(msg.sessionId || '');
+      const cleanName = String(msg.name || `Player ${room.slots.length + 1}`).trim().slice(0, 14) || 'Player';
       if (room.inMatch) {
-        try { conn?.send({ type: 'error', message: `Room '${room.code}' is already in a match.` }); } catch {}
+        // Allow disconnected or desynced players to rejoin mid-match by entering the room code!
+        const match = this._p2pFindRejoinSlot(room, sessId, cleanName);
+        if (match) {
+          this._p2pCompleteRejoin(room, stateOrCid, conn, isStateObj, match, sessId, cleanName);
+          return;
+        }
+        try { conn?.send({ type: 'error', message: `Room '${room.code}' is already in a match (no disconnected player slot to rejoin).` }); } catch {}
         return;
       }
-      const cleanName = String(msg.name || `Player ${room.slots.length + 1}`).trim().slice(0, 14) || 'Player';
-      const sessId = String(msg.sessionId || cid);
+      // If returning to an open lobby with an existing away session, reclaim it cleanly
+      const lobbyMatch = this._p2pFindRejoinSlot(room, sessId, cleanName);
+      if (lobbyMatch && !lobbyMatch.reclaimedFromAi) {
+        this._p2pCompleteRejoin(room, stateOrCid, conn, isStateObj, lobbyMatch, sessId, cleanName);
+        return;
+      }
+      const effectiveSess = sessId || cid;
       let placed = false;
       // When resuming a saved match, claim saved human slots first before adding new slots
       if (room.loadedSave) {
@@ -858,7 +1008,10 @@ export class NetworkClient {
           if (s.kind === 'ai' && s.wantHuman) {
             s.kind = 'human';
             s.clientId = cid;
-            s.sessionId = sessId;
+            s.sessionId = effectiveSess;
+            s.originalSessionId = effectiveSess;
+            s.originalName = cleanName;
+            s.wasHuman = true;
             s.name = cleanName;
             s.wantHuman = false;
             placed = true;
@@ -869,14 +1022,27 @@ export class NetworkClient {
       if (!placed && !room.loadedSave && room.slots.length < 5) {
         const used = new Set(room.slots.map((s) => s.col));
         const pickCol = PLAYER_COLORS.find((c) => !used.has(c)) ?? PLAYER_COLORS[room.slots.length % PLAYER_COLORS.length];
-        room.slots.push({ kind: 'human', clientId: cid, sessionId: sessId, name: cleanName, col: pickCol, dif: 'normal' });
+        room.slots.push({
+          kind: 'human',
+          clientId: cid,
+          sessionId: effectiveSess,
+          originalSessionId: effectiveSess,
+          originalName: cleanName,
+          wasHuman: true,
+          name: cleanName,
+          col: pickCol,
+          dif: 'normal',
+        });
         placed = true;
       } else if (!placed) {
         for (const s of room.slots) {
           if (s.kind === 'ai') {
             s.kind = 'human';
             s.clientId = cid;
-            s.sessionId = sessId;
+            s.sessionId = effectiveSess;
+            s.originalSessionId = effectiveSess;
+            s.originalName = cleanName;
+            s.wasHuman = true;
             s.name = cleanName;
             placed = true;
             break;
@@ -892,6 +1058,27 @@ export class NetworkClient {
       return;
     }
 
+    if (mtype === 'request_sync' && room.inMatch) {
+      if (cid === 'host') {
+        // Host requested "Sync All" -> push authoritative snapshot to every peer
+        this.handlers.onPeerRejoined?.({
+          slot: 0,
+          sendSnapshot: (payload) => {
+            this._p2pBroadcast({ type: 'action', payload }, 'host');
+          },
+        });
+      } else {
+        // Specific guest requested a resync -> push snapshot straight to them
+        this.handlers.onPeerRejoined?.({
+          slot: this._p2pSlotOf(cid),
+          sendSnapshot: (payload) => {
+            this._p2pSendTo(cid, { type: 'action', payload });
+          },
+        });
+      }
+      return;
+    }
+
     if (mtype === 'leave_room' && cid !== 'host') {
       this._p2pHostOnPeerDisconnect(cid, true);
       return;
@@ -902,7 +1089,10 @@ export class NetworkClient {
       if (slotIdx >= 0 && slotIdx < room.slots.length) {
         if ('name' in msg) {
           const nm = String(msg.name || '').trim().slice(0, 14);
-          if (nm) room.slots[slotIdx].name = nm;
+          if (nm) {
+            room.slots[slotIdx].name = nm;
+            room.slots[slotIdx].originalName = nm;
+          }
         }
         if ('col' in msg && PLAYER_COLORS.includes(Number(msg.col))) {
           room.slots[slotIdx].col = Number(msg.col);
@@ -1125,6 +1315,10 @@ export class NetworkClient {
       let slotNum = 0;
       for (let i = 0; i < room.slots.length; i++) {
         if (room.slots[i].clientId === cid) {
+          // Remember original human identity so the disconnected player can rejoin & reclaim this slot later!
+          room.slots[i].wasHuman = true;
+          room.slots[i].originalSessionId = room.slots[i].originalSessionId || room.slots[i].sessionId;
+          room.slots[i].originalName = room.slots[i].originalName || room.slots[i].name;
           room.slots[i].kind = 'ai';
           room.slots[i].clientId = null;
           room.slots[i].sessionId = null;
@@ -1175,7 +1369,21 @@ export class NetworkClient {
         this.handlers.onMatchStart?.(msg);
         break;
       case 'rejoined_match':
+        this.roomCode = msg.code || this.roomCode;
         this.handlers.onReconnecting?.(false);
+        this.handlers.onRejoinedMatch?.(msg);
+        break;
+      case 'peer_reclaimed':
+        this.handlers.onPeerReclaimed?.(msg);
+        break;
+      case 'sync_requested':
+        // Server (WS mode) asks host to push a snapshot to a rejoining/desynced peer
+        this.handlers.onPeerRejoined?.({
+          slot: msg.slot || 0,
+          sendSnapshot: (payload) => {
+            this._sendWS({ type: 'action', payload, targetCid: msg.targetCid || null });
+          },
+        });
         break;
       case 'aim':
         this.handlers.onRemoteAim?.(msg.payload);

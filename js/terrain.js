@@ -436,5 +436,19 @@ export class Terrain {
       return { x: i, y, height, color };
     });
     this.trees = snap.trees.map(([kind, x, y]) => ({ kind, x, y, fall: 0 }));
+    if (!this.clouds.length) {
+      if (this.krajina === 2) {
+        this.clouds = [
+          { spriteId: 73, x: 113.5, y: -119.7, drift: 0 },
+          { spriteId: 73, x: -143.7, y: -145.3, drift: 0 },
+          { spriteId: 73, x: 17.3, y: -251.9, drift: 0 },
+        ];
+      } else if (this.krajina === 3) {
+        this.clouds = [
+          { spriteId: 82, x: 121.0, y: -68.0, drift: 0.2 },
+          { spriteId: 82, x: -134.1, y: -130.8, drift: 0.2 },
+        ];
+      }
+    }
   }
 }

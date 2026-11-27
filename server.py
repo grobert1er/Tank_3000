@@ -180,17 +180,65 @@ class TankServer:
             if not room:
                 await client.send_json({"type": "error", "message": f"Room '{code}' not found."})
                 return
+            client.name = str(msg.get("name") or f"Player {len(room.slots)+1}").strip()[:14] or "Player"
+            sess_id = str(msg.get("sessionId") or "")
             if room.in_match:
-                await client.send_json({"type": "error", "message": f"Room '{code}' is already in a match."})
+                # Allow disconnected / former-human players to rejoin mid-match!
+                rejoin_idx = -1
+                reclaimed = False
+                lower_name = client.name.lower()
+                if sess_id:
+                    rejoin_idx = next((i for i, s in enumerate(room.slots) if s["kind"] == "ai" and s.get("original_session_id") == sess_id), -1)
+                    if rejoin_idx >= 0:
+                        reclaimed = True
+                if rejoin_idx < 0:
+                    rejoin_idx = next((i for i, s in enumerate(room.slots) if s["kind"] == "ai" and s.get("was_human") and (s.get("original_name") or s["name"]).lower() == lower_name), -1)
+                    if rejoin_idx >= 0:
+                        reclaimed = True
+                if rejoin_idx < 0:
+                    former = [i for i, s in enumerate(room.slots) if s["kind"] == "ai" and s.get("was_human")]
+                    if len(former) == 1:
+                        rejoin_idx = former[0]
+                        reclaimed = True
+                if rejoin_idx < 0:
+                    await client.send_json({"type": "error", "message": f"Room '{code}' is already in a match (no disconnected player slot to rejoin)."})
+                    return
+
+                slot = room.slots[rejoin_idx]
+                slot["kind"] = "human"
+                slot["client_id"] = client.id
+                slot["session_id"] = sess_id or client.id
+                slot["was_human"] = True
+                slot["original_session_id"] = slot["session_id"]
+                slot["original_name"] = slot.get("original_name") or slot["name"]
+                room.clients[client.id] = client
+                client.room_code = code
+                slot_num = rejoin_idx + 1
+
+                if reclaimed:
+                    await self.broadcast(room, {"type": "peer_reclaimed", "slot": slot_num, "name": slot["name"]})
+                await client.send_json({
+                    "type": "rejoined_match",
+                    "code": room.code,
+                    "mySlot": slot_num,
+                    "isHost": client.id == room.host_id,
+                    "reclaimed": reclaimed,
+                })
+                host_client = room.clients.get(room.host_id)
+                if host_client and host_client.id != client.id:
+                    await host_client.send_json({"type": "sync_requested", "targetCid": client.id, "slot": slot_num})
                 return
 
-            client.name = str(msg.get("name") or f"Player {len(room.slots)+1}").strip()[:14] or "Player"
             placed = False
             if room.loaded_save:
                 for s in room.slots:
                     if s["kind"] == "ai" and s.get("want_human"):
                         s["kind"] = "human"
                         s["client_id"] = client.id
+                        s["session_id"] = sess_id or client.id
+                        s["was_human"] = True
+                        s["original_session_id"] = s["session_id"]
+                        s["original_name"] = client.name
                         s["name"] = client.name
                         s["want_human"] = False
                         placed = True
@@ -198,13 +246,27 @@ class TankServer:
             if not placed and not room.loaded_save and len(room.slots) < 5:
                 used_cols = {s["col"] for s in room.slots}
                 pick_col = next((c for c in DEFAULT_COLORS if c not in used_cols), DEFAULT_COLORS[len(room.slots) % 6])
-                room.slots.append({"kind": "human", "client_id": client.id, "name": client.name, "col": pick_col, "dif": "normal"})
+                room.slots.append({
+                    "kind": "human",
+                    "client_id": client.id,
+                    "session_id": sess_id or client.id,
+                    "was_human": True,
+                    "original_session_id": sess_id or client.id,
+                    "original_name": client.name,
+                    "name": client.name,
+                    "col": pick_col,
+                    "dif": "normal",
+                })
                 placed = True
             elif not placed:
                 for s in room.slots:
                     if s["kind"] == "ai":
                         s["kind"] = "human"
                         s["client_id"] = client.id
+                        s["session_id"] = sess_id or client.id
+                        s["was_human"] = True
+                        s["original_session_id"] = s["session_id"]
+                        s["original_name"] = client.name
                         s["name"] = client.name
                         placed = True
                         break
@@ -234,6 +296,7 @@ class TankServer:
                     nm = str(msg["name"]).strip()[:14]
                     if nm:
                         room.slots[slot_idx]["name"] = nm
+                        room.slots[slot_idx]["original_name"] = nm
                         client.name = nm
                 if "col" in msg and int(msg["col"]) in DEFAULT_COLORS:
                     room.slots[slot_idx]["col"] = int(msg["col"])
@@ -358,7 +421,21 @@ class TankServer:
             return
 
         if mtype == "action" and room.in_match:
-            await self.broadcast(room, msg, exclude_id=client.id)
+            target_cid = msg.get("targetCid")
+            if target_cid and target_cid in room.clients:
+                await room.clients[target_cid].send_json({"type": "action", "payload": msg.get("payload")})
+            else:
+                await self.broadcast(room, {"type": "action", "payload": msg.get("payload")}, exclude_id=client.id)
+            return
+
+        if mtype == "request_sync" and room.in_match:
+            host_client = room.clients.get(room.host_id)
+            if host_client:
+                await host_client.send_json({
+                    "type": "sync_requested",
+                    "targetCid": None if client.id == room.host_id else client.id,
+                    "slot": room.slot_of(client.id),
+                })
             return
 
         if mtype == "shop_buy" and room.in_match:
@@ -423,6 +500,9 @@ class TankServer:
             slot_num = 0
             for idx, s in enumerate(room.slots):
                 if s["client_id"] == client.id:
+                    s["was_human"] = True
+                    s["original_session_id"] = s.get("original_session_id") or s.get("session_id")
+                    s["original_name"] = s.get("original_name") or s["name"]
                     s["kind"] = "ai"
                     s["client_id"] = None
                     slot_num = idx + 1

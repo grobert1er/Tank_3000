@@ -788,7 +788,21 @@ export class TankGame {
   }
 
   _applySerializedPlayerData(arr) {
-    if (!Array.isArray(arr)) return;
+    if (!Array.isArray(arr) || !arr.length) return;
+    // Support cold-boot mid-match rejoin (e.g. after guest refreshes browser tab)
+    if (this.playerData.length !== arr.length) {
+      this.playerCount = arr.length;
+      this.playerData = arr.map((src, idx) =>
+        createInitialTankData(
+          src.t_num || idx + 1,
+          src.name || `Player ${idx + 1}`,
+          src.col ?? PLAYER_COLORS[idx % PLAYER_COLORS.length],
+          src.type || 'tank',
+          src.dif || 'normal',
+          this.balancePreset
+        )
+      );
+    }
     for (let i = 0; i < Math.min(arr.length, this.playerData.length); i++) {
       const src = arr[i];
       const dst = this.playerData[i];
@@ -1006,7 +1020,7 @@ export class TankGame {
 
     this.tanks = this.playerData.map((pd, idx) => {
       const s = save.tanks?.[idx];
-      const tk = new Tank(pd, s ? s.x : 80 + idx * 85, this.terrain, this.rng);
+      const tk = new Tank(pd, s ? s.x : 80 + idx * 85, this.terrain, this.rng, false);
       if (s) {
         tk.x = s.x;
         tk.y = s.y;
@@ -1078,13 +1092,39 @@ export class TankGame {
       if (this.scene !== 'shop' && !this.roundTransitioning) {
         this.roundEndPending = false;
         this.roundTransitioning = true;
-        this._spawnClona({
-          projizdi: false,
-          targetScene: 'shop',
-          purchasing: true,
-          speed: 10,
-          k: 2340,
-        });
+        if (this.scene !== 'battle') {
+          // Cold-boot directly into open shop after refresh/rejoin
+          this.scene = 'shop';
+          this.shopCur = this.mySlot;
+          this.onlineReadySent = false;
+          this.onlineReadyStatus = '';
+          this.tanks = [];
+          this.projectiles = [];
+          this.clona = {
+            projizdi: false,
+            targetScene: 'shop',
+            purchasing: true,
+            openingAfterShop: false,
+            lx: -137.5,
+            rx: 137.0,
+            speed: 0,
+            k: 2340,
+            firstClosed: false,
+            swapped: false,
+          };
+          this.roundTransitioning = false;
+        } else {
+          this._spawnClona({
+            projizdi: false,
+            targetScene: 'shop',
+            purchasing: true,
+            speed: 10,
+            k: 2340,
+          });
+        }
+      }
+      if (snap.forceImmediate) {
+        this.showToast('Synced with host!', '#7ef29d', 50);
       }
       this._notifyStatus();
       return;
@@ -1106,7 +1146,7 @@ export class TankGame {
     if (this.tanks.length !== this.playerData.length) {
       this.tanks = this.playerData.map((pd, idx) => {
         const s = snap.tanks?.[idx];
-        return new Tank(pd, s ? s.x : 100 + idx * 80, this.terrain, this.rng);
+        return new Tank(pd, s ? s.x : 100 + idx * 80, this.terrain, this.rng, false);
       });
     }
 
@@ -1167,6 +1207,9 @@ export class TankGame {
     if (this.activeTank && this.activeTank.data.live && this.activeTank.tankNumber !== prevActiveNum) {
       this.blik = { x: this.activeTank.x, y: this.activeTank.y - 10, frame: 0 };
       this.activeTank.onTurnStart();
+    }
+    if (snap.forceImmediate) {
+      this.showToast('Synced with host!', '#7ef29d', 50);
     }
     this._notifyStatus();
   }

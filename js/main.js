@@ -7,7 +7,7 @@ import {
 import { VectorRenderer } from './renderer.js';
 import { SoundManager } from './audio.js';
 import { TankGame } from './game.js';
-import { NetworkClient } from './network.js';
+import { NetworkClient, getLastRoomSession } from './network.js';
 
 const COLOR_HEX = PLAYER_COLORS.map((c) => '#' + c.toString(16).padStart(6, '0'));
 
@@ -24,6 +24,7 @@ async function boot() {
   const btnFullscreen = document.getElementById('btn-fullscreen');
   const btnControls = document.getElementById('btn-controls');
   const statusPill = document.getElementById('status-pill');
+  const btnResync = document.getElementById('btn-resync');
   const btnFastForward = document.getElementById('btn-fast-forward');
   const btnAwayBot = document.getElementById('btn-away-bot');
   const localRulesBar = document.getElementById('local-rules-bar');
@@ -303,6 +304,33 @@ async function boot() {
     }
   }
 
+  function refreshResyncButton() {
+    if (game && game.mode === 'online' && (game.scene === 'battle' || game.scene === 'shop')) {
+      btnResync.hidden = false;
+      btnResync.textContent = game.isHost ? '🔄 Sync All' : '🔄 Resync';
+      btnResync.title = game.isHost
+        ? 'Broadcast authoritative state snapshot to all connected players'
+        : 'Re-pull full match state from the host (or reconnect if disconnected)';
+    } else {
+      btnResync.hidden = true;
+    }
+  }
+
+  btnResync.addEventListener('click', () => {
+    if (!game || game.mode !== 'online') return;
+    if (game.isHost) {
+      net.sendAction({
+        type: 'state_sync',
+        forceImmediate: true,
+        ...game.buildSyncSnapshot(),
+      });
+      game.showToast('Synced all players!', '#7ef29d', 45);
+    } else {
+      statusPill.textContent = `Resyncing ${net.roomCode || ''}...`;
+      net.requestSync();
+    }
+  });
+
   btnAwayBot.addEventListener('click', () => {
     const slotNum = Number(btnAwayBot.dataset.slot || 0);
     if (slotNum > 0) net.replaceAwayWithBot(slotNum);
@@ -360,6 +388,7 @@ async function boot() {
       lobbyEntry.hidden = false;
       currentAwaySlots = [];
       refreshAwayButton();
+      refreshResyncButton();
       statusPill.textContent = 'Local Mode';
     },
     onMatchStart: (msg) => {
@@ -376,7 +405,29 @@ async function boot() {
         isHost: msg.isHost,
       });
       refreshAwayButton();
+      refreshResyncButton();
       statusPill.textContent = `Online Room ${msg.code} · Round ${game.gameRound}`;
+    },
+    onRejoinedMatch: (msg) => {
+      lobbyModal.hidden = true;
+      savesModal.hidden = true;
+      game.mode = 'online';
+      game.mySlot = msg.mySlot;
+      game.isHost = Boolean(msg.isHost);
+      refreshAwayButton();
+      refreshResyncButton();
+      statusPill.textContent = `Rejoined ${msg.code || ''} · Syncing...`;
+    },
+    onPeerReclaimed: ({ slot, name }) => {
+      stepSimulation(performance.now());
+      if (game && game.mode === 'online' && slot >= 1 && slot <= game.playerData.length) {
+        game.playerData[slot - 1].type = 'tank';
+        if (game.tanks[slot - 1]) {
+          game.tanks[slot - 1].type = 'tank';
+          game.tanks[slot - 1].firstFrame = true;
+        }
+        game.showToast(`${name || game.playerData[slot - 1].name} rejoined!`, '#7ef29d', 55);
+      }
     },
     onRemoteAim: (payload) => {
       stepSimulation(performance.now());
@@ -651,6 +702,7 @@ async function boot() {
     onAutoSave: (save) => writeAutoSave(save),
     onStatusChange: (st) => {
       localRulesBar.hidden = !(st.mode === 'local' && (st.scene === 'menu1' || st.scene === 'menu2'));
+      refreshResyncButton();
       if (st.mode === 'online') {
         statusPill.textContent = `Online ${net.roomCode || ''} · R${st.round}${st.activePlayer ? ' · ' + st.activePlayer : ''}`;
       } else {
@@ -692,9 +744,15 @@ async function boot() {
   updateTransportHint();
 
   const urlRoom = urlParams.get('room');
+  const lastRoom = getLastRoomSession();
   if (urlRoom) {
     inputCode.value = urlRoom.toUpperCase();
+    if (lastRoom?.name) inputName.value = lastRoom.name;
     lobbyModal.hidden = false;
+  } else if (lastRoom) {
+    // Pre-fill last room & name so rejoining after a refresh or disconnect takes 1 click
+    if (lastRoom.code) inputCode.value = lastRoom.code;
+    if (lastRoom.name) inputName.value = lastRoom.name;
   }
 
   // ==================== CANVAS INPUT MAPPING ====================

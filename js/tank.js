@@ -11,7 +11,7 @@ import {
 import { rgbToCx, alphaCx } from './renderer.js';
 
 export class Tank {
-  constructor(data, x, terrain, rng) {
+  constructor(data, x, terrain, rng, flatten = true) {
     this.data = data; // persistent player record
     this.tankNumber = data.t_num;
     this.type = data.type; // 'tank' | 'ai'
@@ -19,7 +19,9 @@ export class Tank {
 
     this.x = x;
     this.y = terrain.topY(Math.round(x)) - 4;
-    terrain.flattenUnderTank(this.x, this.y, TANK_WIDTH, TANK_HEIGHT);
+    if (flatten) {
+      terrain.flattenUnderTank(this.x, this.y, TANK_WIDTH, TANK_HEIGHT);
+    }
 
     this.rotace = rng.random(67) * 2 + 46; // 46..178 even degrees
     this.power = 50;
