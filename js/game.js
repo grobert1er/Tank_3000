@@ -1134,7 +1134,14 @@ export class TankGame {
       // Tick AI controller if active tank is AI (and locally owned: always in local mode, host-only in online mode)
       if (this.activeTank && this.activeTank.playing && this.activeTank.type === 'ai') {
         if (this.mode === 'local' || this.isHost) {
-          tickAI(this.activeTank, this);
+          try {
+            tickAI(this.activeTank, this);
+          } catch (err) {
+            console.error('AI turn error, falling back to safe shot:', err);
+            this.activeTank.firstFrame = true;
+            this.activeTank.data.cur_gun = 0;
+            this.fireCurrentTank();
+          }
         }
       }
 

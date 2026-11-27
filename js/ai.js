@@ -291,7 +291,7 @@ function simulateRollPhase(tank, target, game, startX, uphill, impactT) {
 
 // Find optimal (rotace, power) using coarse physics sweep + integer local refinement
 export function solveBallisticShot(tank, target, game, opts = {}) {
-  const maxPow = Math.max(5, Math.min(100, Math.floor(tank.data.energy)));
+  const maxPow = Math.max(1, Math.min(100, Math.floor(tank.data.energy)));
   const minSafeSelf = opts.minSafeSelf ?? 18;
   const requireSplitTime = Boolean(opts.requireSplitTime);
   const targetRight = target.x >= tank.x;
@@ -318,10 +318,12 @@ export function solveBallisticShot(tank, target, game, opts = {}) {
     return s;
   };
 
-  // Coarse grid search (every 3 degrees x every 5 power)
+  // Coarse grid search (handles low-energy tanks with maxPow < 8 cleanly)
+  const powStart = maxPow < 8 ? 1 : 8;
+  const powStep = maxPow < 8 ? 1 : 5;
   const topSeeds = [];
   for (let rot = rotMin; rot <= rotMax; rot += 3) {
-    for (let pow = 8; pow <= maxPow; pow += 5) {
+    for (let pow = powStart; pow <= maxPow; pow += powStep) {
       const sim = simulateTrajectory(tank, target, game, rot, pow, opts);
       const sc = scoreCandidate(sim, rot);
       if (topSeeds.length < 6 || sc < topSeeds[topSeeds.length - 1].sc) {
@@ -333,19 +335,20 @@ export function solveBallisticShot(tank, target, game, opts = {}) {
   }
 
   // Fine integer refinement around best coarse regions
-  let best = topSeeds[0] || {
-    rot: targetRight ? 135 : 45,
-    pow: Math.min(maxPow, 50),
-    sim: { hit: false, direct: false, hitTarget: false, dist: 999, selfDist: 999, t: 0 },
-    sc: 99999,
-  };
+  let best = topSeeds[0];
+  if (!best) {
+    const fbRot = targetRight ? 135 : 45;
+    const fbPow = Math.min(maxPow, 50);
+    const fbSim = simulateTrajectory(tank, target, game, fbRot, fbPow, opts);
+    best = { rot: fbRot, pow: fbPow, sim: fbSim, sc: scoreCandidate(fbSim, fbRot) };
+  }
 
   const visited = new Set();
   for (let si = 0; si < topSeeds.length; si++) {
     const seed = topSeeds[si];
     const r0 = Math.max(1, seed.rot - 3);
     const r1 = Math.min(179, seed.rot + 3);
-    const p0 = Math.max(4, seed.pow - 6);
+    const p0 = Math.max(1, seed.pow - 6);
     const p1 = Math.min(maxPow, seed.pow + 6);
     for (let rot = r0; rot <= r1; rot++) {
       for (let pow = p0; pow <= p1; pow++) {
@@ -368,7 +371,7 @@ export function solveBallisticShot(tank, target, game, opts = {}) {
     for (let dr = -1; dr <= 1; dr += 0.5) {
       for (let dp = -1; dp <= 1; dp += 0.5) {
         const rot = Math.max(1, Math.min(179, baseR + dr));
-        const pow = Math.max(4, Math.min(maxPow, baseP + dp));
+        const pow = Math.max(1, Math.min(maxPow, baseP + dp));
         const sim = simulateTrajectory(tank, target, game, rot, pow, opts);
         const sc = scoreCandidate(sim, rot);
         if (sc < best.sc) {
@@ -727,8 +730,8 @@ export function aiBuyInShop(slot, game) {
 export function aiPrepareShot(tank, game) {
   let prep = true;
   const targetRot = Math.max(0, Math.min(180, Math.round(tank.pRotace * 2) / 2));
-  const maxPow = Math.min(100, Math.floor(tank.data.energy));
-  const targetPow = Math.max(1, Math.min(maxPow, Math.round(tank.pPower * 2) / 2));
+  const maxPow = Math.max(0, Math.min(100, tank.data.energy));
+  const targetPow = Math.max(0, Math.min(maxPow, Math.round(tank.pPower * 2) / 2));
 
   const diffRot = Math.abs(tank.rotace - targetRot);
   if (diffRot > 0.25) {
@@ -759,20 +762,25 @@ export function aiPrepareShot(tank, game) {
   }
 
   if (tank.pMove && Math.round(tank.pX) !== Math.round(tank.x) && tank.data.fuel > 0) {
-    prep = false;
+    const prevX = tank.x;
     const moved = Math.round(tank.pX) < Math.round(tank.x)
       ? tank.moveLeft(game.tanks)
       : tank.moveRight(game.tanks);
-    if (!moved) tank.pMove = false;
+    if (!moved || Math.abs(tank.x - prevX) < 0.05) {
+      tank.pMove = false;
+    } else {
+      prep = false;
+    }
   }
 
   return prep;
 }
 
 export function tickAI(tank, game) {
-  if (!tank.playing || tank.type !== 'ai' || !tank.data.live) return;
+  if (!tank.playing || tank.type !== 'ai' || !tank.data.live || tank.data.energy <= 0) return;
 
   if (tank.firstFrame) {
+    tank._aiTurnFrames = 0;
     const prof = getProfile(tank.dif);
     const prevTargetNum = tank.target?.tankNumber ?? 0;
 
@@ -793,49 +801,58 @@ export function tickAI(tank, game) {
     const plan = aiPickWeaponAndPlan(tank, target, game, prof);
 
     if (plan.action === 'teleport') {
-      tank.firstFrame = true;
       game.beginTeleport(false, true);
       if (game.teleport) {
+        tank.firstFrame = true;
         game.teleport.cursorX = plan.spot.x;
         game.teleport.cursorY = plan.spot.y;
         game._aiPendingTeleport = { x: plan.spot.x, y: plan.spot.y, delay: 10 };
+        return;
       }
-      return;
     }
 
     if (plan.action === 'astrike') {
       game.selectWeapon(plan.gun, false, true);
-      tank.firstFrame = true;
       tank.lastWind = game.terrain.vitr;
       game.fireCurrentTank();
       if (game.airStrike) {
+        tank.firstFrame = true;
         game.airStrike.uhel = plan.uhel;
         game.airStrike.cursorX = plan.targetX;
         game.airStrike.cursorY = 110;
         game._aiPendingAirStrike = { x: plan.targetX, uhel: plan.uhel, delay: 14 };
+        return;
       }
-      return;
     }
 
     // Standard / Roller / Cluster ballistic fire plan
-    game.selectWeapon(plan.gun, false, true);
+    const sol = plan.sol || solveBallisticShot(tank, target, game, {
+      minSafeSelf: prof.selfSafeCheck ? 20 : 0,
+    });
+    const gunId = typeof plan.gun === 'number' ? plan.gun : 0;
+    game.selectWeapon(gunId, false, true);
 
     // Apply difficulty scatter (tightens on consecutive turns against same target)
     const decay = Math.pow(prof.followUpDecay, tank.aiConsecShots || 0);
     const aiRng = game.aiRng || game.rng;
     const rotErr = (aiRng.nextFloat() * 2 - 1) * prof.rotScatter * decay;
     const powErr = (aiRng.nextFloat() * 2 - 1) * prof.powScatter * decay;
-    const maxPow = Math.max(1, Math.min(100, Math.floor(tank.data.energy)));
+    const maxPow = Math.max(0, Math.min(100, tank.data.energy));
+    const minPow = Math.min(2, maxPow);
 
-    tank.pRotace = Math.max(1, Math.min(179, plan.sol.rot + rotErr));
-    tank.pPower = Math.max(2, Math.min(maxPow, plan.sol.pow + powErr));
+    tank.pRotace = Math.max(1, Math.min(179, sol.rot + rotErr));
+    tank.pPower = Math.max(minPow, Math.min(maxPow, sol.pow + powErr));
     tank.pMove = false;
     tank.firstFrame = false;
   }
 
-  if (aiPrepareShot(tank, game)) {
+  tank._aiTurnFrames = (tank._aiTurnFrames || 0) + 1;
+  if (aiPrepareShot(tank, game) || tank._aiTurnFrames >= 75) {
+    tank.power = Math.max(0, Math.min(100, tank.data.energy, tank.power));
+    game.sound.stop(SOUNDS.TURRET_MOVE);
     tank.lastWind = game.terrain.vitr;
     tank.firstFrame = true;
+    tank._aiTurnFrames = 0;
     game.fireCurrentTank();
   }
 }
