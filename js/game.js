@@ -53,9 +53,11 @@ export class TankGame {
 
     // Active battle state
     this.tanks = [];
-    this.activeTank = null; // _root.na_rade
-    this.nextTank = null;   // _root.next
-    this.aliveCount = 0;    // _root.hracu
+    this.turnOrder = [];
+    this.turnIdx = 0;
+    this.activeTank = null;
+    this.nextTank = null;
+    this.aliveCount = 0;
     this.testing = false;
     this.shotFlying = false;
     this.roundEndPending = false;
@@ -258,15 +260,13 @@ export class TankGame {
       this.tanks.push(tank);
     }
 
-    // Lowest total_score goes first
-    let first = this.tanks[0];
-    for (let i = 0; i < this.tanks.length; i++) {
-      if (this.tanks[i].data.total_score < first.data.total_score) {
-        first = this.tanks[i];
-      }
-    }
-    this.nextTank = first;
-    this.activeTank = first;
+    // Sort round turn order strictly from lowest total_score to highest total_score
+    this.turnOrder = [...this.tanks].sort(
+      (a, b) => a.data.total_score - b.data.total_score || a.tankNumber - b.tankNumber
+    );
+    this.turnIdx = 0;
+    this.nextTank = this.turnOrder[0] || null;
+    this.activeTank = this.turnOrder[0] || null;
     this.aliveCount = this.playerCount;
 
     // Settle all tanks before starting the first turn
@@ -284,16 +284,16 @@ export class TankGame {
     this.testing = true;
   }
 
-  // Advance to the next alive player's turn
+  // Advance to the next alive player in ascending score order (lowest -> highest)
   nextPlayer() {
-    if (this.aliveCount <= 1) return;
+    if (this.aliveCount <= 1 || !this.turnOrder.length) return;
     let safety = 0;
-    while (safety++ < 10) {
-      this.activeTank = this.nextTank;
-      const nextNum = this.activeTank.tankNumber < this.playerCount
-        ? this.activeTank.tankNumber + 1
-        : 1;
-      this.nextTank = this.tanks[nextNum - 1];
+    const total = this.turnOrder.length;
+    while (safety++ < total + 2) {
+      const cand = this.turnOrder[this.turnIdx % total];
+      this.turnIdx = (this.turnIdx + 1) % total;
+      this.activeTank = cand;
+      this.nextTank = this.turnOrder[this.turnIdx % total];
       this.activeTank.playing = true;
       if (this.activeTank.data.live) break;
       this.activeTank.playing = false;
