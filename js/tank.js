@@ -1,0 +1,542 @@
+// Tank entity physics, damage, armor, shields, parachutes, and death explosion
+
+import {
+  STAGE_W, STAGE_H,
+  TANK_WIDTH, TANK_HEIGHT, TANK_HALF_W, TANK_HALF_H,
+  TANK_PASY_LEFT, TANK_PASY_RIGHT, TANK_PASY_TOP, TANK_PASY_BOTTOM,
+  TANK_DEATH_EXPL_W, TANK_DEATH_EXPL_H,
+  SHIELD_RADIUS, SHIELD_TIERS, SOUNDS,
+} from './constants.js';
+import { rgbToCx, alphaCx } from './renderer.js';
+
+export class Tank {
+  constructor(data, x, terrain, rng) {
+    this.data = data; // persistent player record (_root['tank_' + i])
+    this.tankNumber = data.t_num;
+    this.type = data.type; // 'tank' | 'ai'
+    this.dif = data.dif;
+
+    this.x = x;
+    this.y = terrain.topY(Math.round(x)) - 4;
+    terrain.flattenUnderTank(this.x, this.y, TANK_WIDTH, TANK_HEIGHT);
+
+    // Exact Sprite 31 Frame 1 init
+    this.rotace = rng.random(67) * 2 + 46; // 46..178 even degrees
+    this.power = 50;
+    this.playing = false;
+    this.testing = false;
+    this.naZemi = false;
+    this.left = true;
+    this.right = true;
+    this.moving = false;
+    this.fall = 0;
+    this.hillUp = 0.5;
+    this.test = true;
+    this.x1 = 0; this.x2 = 0; this.x3 = 0;
+    this.y1 = 0; this.y2 = 0; this.y3 = 0;
+
+    // Parachute state
+    this.par = data.specials[0] > 0;
+    this.parActive = false;
+    this.parOut = false;
+    this.parUsed = false;
+
+    // Shield state (weak_sh=100, shield_sh=200, strong_sh=400, super_sh=600)
+    this.shActive = false;
+    this.shieldTier = 0;
+    this.shieldEnergy = 0;
+    this.shieldMax = 0;
+    this.shieldSprite = null;
+
+    // Barrel recoil animation (hlaven: 15 frames, frame 0 = idle)
+    this.barrelFrame = 0;
+    this.barrelPlaying = false;
+
+    // Visibility (hidden during teleport frames 17..40)
+    this.visible = true;
+
+    // Death explosion animation (frames 4..15)
+    this.dying = false;
+    this.dead = false;
+    this.deathFrame = 0;
+
+    // Fuel consumption per move step: 1 / (specials[10] + 1)
+    this.fuelC = 1 / (data.specials[10] + 1);
+
+    // AI tracking fields (used by AI controller & updated on shot impact)
+    this.lastShotX = this.x;
+    this.lastShotY = this.y;
+    this.lastShotOut = false;
+    this.lastWind = 0;
+    this.rounds = 0;
+    this.firstShot = true;
+    this.firstFrame = true;
+    this.target = null;
+    this.pRotace = this.rotace;
+    this.pPower = this.power;
+    this.pX = this.x;
+    this.pMove = false;
+  }
+
+  calcHillUp() {
+    this.hillUp = 0.5 + this.data.specials[11] - this.fall * 10;
+  }
+
+  // Exact test_hill() from Sprite 31 Frame 1
+  testHill(terrain) {
+    this.calcHillUp();
+    const leftCeil = terrain.topY(Math.ceil(this.x - TANK_HALF_W));
+    const leftFloor = terrain.topY(Math.floor(this.x - TANK_HALF_W));
+    if (leftCeil < this.y - this.hillUp || leftFloor < this.y - this.hillUp) {
+      this.x += 0.7;
+      this.test = false;
+      this.left = false;
+      this.right = false;
+      return;
+    }
+    const rightFloor = terrain.topY(Math.floor(this.x + TANK_HALF_W));
+    const rightCeil = terrain.topY(Math.ceil(this.x + TANK_HALF_W));
+    if (rightFloor < this.y - this.hillUp || rightCeil < this.y - this.hillUp) {
+      this.left = false;
+      this.right = false;
+      this.x -= 0.7;
+      this.test = false;
+      return;
+    }
+    this.left = true;
+    this.right = true;
+  }
+
+  // Exact move_left() / move_right() from Sprite 31 Frame 1
+  moveLeft(tanks) {
+    if (this.data.fuel <= 0 || this.x <= 10 || !this.left) return false;
+    this.x -= 0.5;
+    this.data.fuel = Math.max(0, this.data.fuel - this.fuelC);
+    this.moving = true;
+    for (const other of tanks) {
+      if (other.tankNumber !== this.tankNumber && other.data.live && this.hitTestTank(other)) {
+        this.x += 0.6;
+      }
+    }
+    return true;
+  }
+
+  moveRight(tanks) {
+    if (this.data.fuel <= 0 || this.x >= STAGE_W - 10 || !this.right) return false;
+    this.x += 0.5;
+    this.data.fuel = Math.max(0, this.data.fuel - this.fuelC);
+    this.moving = true;
+    for (const other of tanks) {
+      if (other.tankNumber !== this.tankNumber && other.data.live && this.hitTestTank(other)) {
+        this.x -= 0.6;
+      }
+    }
+    return true;
+  }
+
+  activateShield(tier) {
+    const spec = SHIELD_TIERS[tier];
+    if (!spec) return false;
+    if (this.shActive || this.data.specials[spec.specialIdx] <= 0) return false;
+    this.data.specials[spec.specialIdx] -= 1;
+    this.shActive = true;
+    this.shieldTier = tier;
+    this.shieldEnergy = spec.maxEnergy;
+    this.shieldMax = spec.maxEnergy;
+    this.shieldSprite = spec.sprite;
+    return true;
+  }
+
+  disableShield() {
+    this.shActive = false;
+    this.shieldTier = 0;
+    this.shieldEnergy = 0;
+    this.shieldMax = 0;
+    this.shieldSprite = null;
+  }
+
+  // Exact shield.damage(dam, attacker) from Sprites 311/313/315/317
+  damageShield(dam, attacker) {
+    this.shieldEnergy -= dam;
+    if (this.shieldEnergy <= 0) {
+      const overflow = Math.abs(this.shieldEnergy) * 2;
+      this.disableShield();
+      // Pass remaining overflow damage directly to tank body (shActive is now false)
+      this.damage(overflow, attacker, false);
+    }
+  }
+
+  // Exact damage(damag, attacker, par) from Sprite 31 Frame 1 lines 118-161
+  damage(damag, attacker, isFall = false) {
+    if (!this.data.live) return;
+    let armor = 1;
+    let arm = 1;
+    for (let i = 0; i < this.data.specials[9]; i++) {
+      armor = armor / (1.12 / arm);
+      arm = arm / 1.0002;
+    }
+
+    if (!this.shActive || isFall) {
+      this.data.energy = this.data.energy - damag * armor;
+    } else {
+      this.damageShield(damag, attacker);
+      return;
+    }
+
+    if (this.data.energy <= 0) {
+      if (attacker && attacker !== this) {
+        attacker.data.kills += 1;
+        attacker.data.score += 5000;
+        attacker.data.total_score += 5000;
+      } else {
+        this.data.kills -= 1;
+        this.data.score -= 2000;
+        this.data.total_score -= 2000;
+      }
+    }
+
+    if (attacker && attacker !== this) {
+      attacker.data.score += damag * 100;
+      attacker.data.total_score += damag * 100;
+    } else {
+      let selfDmg = damag;
+      if (isFall) selfDmg = selfDmg / 3;
+      this.data.score -= Math.round(selfDmg * 50);
+      this.data.total_score -= Math.round(selfDmg * 50);
+      if (this.data.score < 0) this.data.score = 0;
+    }
+  }
+
+  onTurnStart() {
+    this.rounds += 1;
+    this.parActive = false;
+    this.firstFrame = true;
+    this.calcHillUp();
+  }
+
+  // Exact pasy.hitTest(land_x): treads box [x-4.8, x+4.8] x [y+2.5, y+4.1] vs column
+  pasyHitCol(col) {
+    if (!col || col.height <= 0) return false;
+    const colTop = col.y - col.height / 2;
+    const colBot = col.y + col.height / 2;
+    const colLeft = col.x - 0.5;
+    const colRight = col.x + 0.5;
+    const pLeft = this.x + TANK_PASY_LEFT;
+    const pRight = this.x + TANK_PASY_RIGHT;
+    const pTop = this.y + TANK_PASY_TOP;
+    const pBot = this.y + TANK_PASY_BOTTOM;
+    return pRight >= colLeft && pLeft <= colRight && pBot >= colTop && pTop <= colBot;
+  }
+
+  // Bounding box overlap with another tank
+  hitTestTank(other) {
+    return (
+      Math.abs(this.x - other.x) < TANK_WIDTH &&
+      Math.abs(this.y - other.y) < TANK_HEIGHT
+    );
+  }
+
+  // Hit test a projectile point/box against this tank or its active shield
+  hitTestProjectile(px, py, halfW = 1.15, halfH = 1.15, includeShield = true) {
+    if (!this.data.live && !this.dying) return false;
+    if (includeShield && this.shActive) {
+      return (
+        Math.abs(px - this.x) <= SHIELD_RADIUS + halfW &&
+        Math.abs(py - this.y) <= SHIELD_RADIUS + halfH
+      );
+    }
+    return (
+      Math.abs(px - this.x) <= TANK_HALF_W + halfW &&
+      Math.abs(py - this.y) <= TANK_HALF_H + halfH
+    );
+  }
+
+  // Hit test explosion bounding box against tank or shield
+  hitTestExplosion(ex, ey, halfW, halfH) {
+    if (!this.data.live) return false;
+    const hitBody =
+      Math.abs(ex - this.x) <= halfW + TANK_HALF_W &&
+      Math.abs(ey - this.y) <= halfH + TANK_HALF_H;
+    if (hitBody) return true;
+    if (this.shActive) {
+      return (
+        Math.abs(ex - this.x) <= halfW + SHIELD_RADIUS &&
+        Math.abs(ey - this.y) <= halfH + SHIELD_RADIUS
+      );
+    }
+    return false;
+  }
+
+  // Exact ground/falling physics loop shared between playing and testing states
+  _stepGroundPhysics(terrain, isTesting) {
+    if (!isTesting) {
+      this.naZemi = false;
+      this.left = true;
+      this.right = true;
+    }
+    let min = 500;
+    let gg = false;
+    this.testHill(terrain);
+
+    for (let i = 0; i < TANK_WIDTH; i++) {
+      const col = terrain.getCol(Math.round(this.x - TANK_HALF_W + i));
+      if (col && this.pasyHitCol(col)) {
+        if (!isTesting) {
+          this.naZemi = true;
+          if (this.parOut) {
+            this.parOut = false;
+          }
+          if (this.fall > 0.4) {
+            const threshold = this.type === 'ai' ? 0.8 : 2.0;
+            if (this.fall < threshold) {
+              this.damage(Math.round(this.fall * 25), this, true);
+            } else {
+              this.damage(Math.round(this.fall * this.fall * 3000), this, true);
+            }
+          }
+          this.fall = 0;
+        } else {
+          if (this.fall > 0.4) {
+            if (this.fall < 0.8) {
+              this.damage(Math.round(this.fall * 25), this, true);
+            } else {
+              this.damage(Math.round(this.fall * this.fall * 80), this, true);
+            }
+          }
+          if (this.parOut) {
+            this.parOut = false;
+          }
+          this.naZemi = true;
+          this.fall = 0;
+        }
+      }
+
+      if (col) {
+        const top = col.y - col.height / 2;
+        if (top < min && this.naZemi) {
+          gg = true;
+          min = top;
+        }
+      }
+      if (i + 1 >= TANK_WIDTH && this.naZemi && gg) {
+        this.y = min - 2;
+        gg = false;
+      }
+      if (isTesting && this.fall > 0.001) {
+        this.test = false;
+      }
+
+      if (!this.naZemi) {
+        if (this.fall >= 0.2 && this.par && this.data.specials[0] > 0) {
+          if (!this.parActive) {
+            this.parActive = true;
+            this.data.specials[0] = Math.max(0, this.data.specials[0] - 1);
+            if (this.data.specials[0] <= 0) this.par = false;
+          }
+          this.parOut = true;
+        }
+        this.y += this.fall;
+        if (!this.parOut) {
+          this.fall += 0.01;
+        } else {
+          this.fall = 0.2;
+          this.x += terrain.vitr / 3000;
+        }
+      }
+    }
+  }
+
+  // Step 1 frame at 25Hz
+  tick(game, input) {
+    // Barrel recoil animation (15 frames)
+    if (this.barrelPlaying) {
+      this.barrelFrame++;
+      if (this.barrelFrame >= 15) {
+        this.barrelFrame = 0;
+        this.barrelPlaying = false;
+      }
+    }
+
+    if (this.dead) return;
+
+    // Death explosion animation timeline (Frames 4..15)
+    if (this.dying) {
+      this.deathFrame++;
+      if (this.deathFrame === 9) {
+        // Frame 9: carve death crater and damage nearby tanks (exact Sprite 31 Frame 9)
+        game.terrain.carveTankDeath(this.x, this.y, TANK_DEATH_EXPL_W, TANK_DEATH_EXPL_H);
+        for (const other of game.tanks) {
+          if (other.tankNumber === this.tankNumber || !other.data.live) continue;
+          if (other.hitTestExplosion(this.x, this.y, TANK_DEATH_EXPL_W / 2, TANK_DEATH_EXPL_H / 2)) {
+            const dx = this.x - other.x;
+            const dy = this.y - other.y;
+            const vzd = Math.sqrt(dx * dx + dy * dy);
+            let damg;
+            if (!other.shActive) {
+              damg = Math.round(TANK_DEATH_EXPL_W / ((vzd + 1) / 14));
+              if (other.data.energy < damg) damg = other.data.energy;
+            } else {
+              damg = Math.round(TANK_DEATH_EXPL_W / ((vzd / 2 + 1) / 18));
+            }
+            other.damage(damg, this, false);
+          }
+        }
+      }
+      if (this.deathFrame >= 15) {
+        this.dead = true;
+        this.dying = false;
+        if (this.playing) {
+          this.playing = false;
+          game.triggerTest();
+        }
+      }
+      return;
+    }
+
+    // Check fell off bottom of screen (y > 400)
+    if (this.y > STAGE_H) {
+      this.data.live = false;
+      this.data.energy = 0;
+      this.data.score = Math.max(0, this.data.score - 2000);
+      this._beginDeath(game);
+      return;
+    }
+
+    // Check energy depleted (energy <= 0)
+    if (this.data.energy <= 0) {
+      this.data.energy = 0;
+      this.data.live = false;
+      this._beginDeath(game);
+      return;
+    }
+
+    // Active turn controls (for human tank)
+    if (this.playing && this.type === 'tank' && input) {
+      if (input.left && this.left && this.data.fuel > 0 && this.x > 10) {
+        this.moveLeft(game.tanks);
+      } else if (input.right && this.right && this.data.fuel > 0 && this.x < STAGE_W - 10) {
+        this.moveRight(game.tanks);
+      } else {
+        this.moving = false;
+      }
+
+      if (input.fire) {
+        game.fireCurrentTank();
+        return;
+      }
+
+      this._stepGroundPhysics(game.terrain, false);
+
+      // Power up/down (PageUp / PageDown + W/S aliases)
+      if (input.powerUp && this.power < 100 && this.power < this.data.energy) {
+        this.power = Math.min(100, this.power + 1);
+      } else if (input.powerDown && this.power > 0) {
+        this.power = Math.max(0, this.power - 1);
+      }
+      if (this.power > this.data.energy) {
+        this.power = this.data.energy;
+      }
+
+      // Angle up/down (Up/Down arrows, step = 2 deg)
+      let rotatingTurret = false;
+      if (input.angleUp && this.rotace < 180) {
+        this.rotace = Math.min(180, this.rotace + 2);
+        rotatingTurret = true;
+      }
+      if (input.angleDown && this.rotace > 0) {
+        this.rotace = Math.max(0, this.rotace - 2);
+        rotatingTurret = true;
+      }
+      if (rotatingTurret) {
+        game.sound.play(SOUNDS.TURRET_MOVE, { volume: 0.45, noMultiple: true });
+      } else if (!game.draggingAngle) {
+        game.sound.stop(SOUNDS.TURRET_MOVE);
+      }
+    } else if (this.playing && this.type === 'ai') {
+      // Ground physics during AI turn
+      this._stepGroundPhysics(game.terrain, false);
+      if (this.power > this.data.energy) {
+        this.power = this.data.energy;
+      }
+    }
+
+    // Settling / falling check phase (testing == true)
+    if (this.testing) {
+      this._stepGroundPhysics(game.terrain, true);
+      if (this.fall > 0.001) {
+        this.test = false;
+      }
+      this.testHill(game.terrain);
+      this.x3 = this.x2;
+      this.x2 = this.x1;
+      this.x1 = Math.round(this.x);
+      this.y3 = this.y2;
+      this.y2 = this.y1;
+      this.y1 = Math.round(this.y * 10) / 10;
+      if (this.y1 === this.y3 && this.x1 === this.x3) {
+        this.test = true;
+      }
+      if (this.test) {
+        this.testing = false;
+      }
+      this.test = true;
+    }
+  }
+
+  _beginDeath(game) {
+    this.dying = true;
+    this.deathFrame = 4;
+    this.parOut = false;
+    this.disableShield();
+    this.testing = false;
+    game.aliveCount = Math.max(0, game.aliveCount - 1);
+    game.sound.play(SOUNDS.TANK_EXPLODE, { volume: 0.9, minIntervalMs: 50 });
+  }
+
+  render(ctx, renderer) {
+    if (this.dead || !this.visible) return;
+
+    if (this.dying) {
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      renderer.drawSprite(ctx, 'tank', { frame: Math.min(14, Math.max(3, this.deathFrame - 1)) });
+      ctx.restore();
+      return;
+    }
+
+    // Parachute behind/above tank
+    if (this.parOut) {
+      ctx.save();
+      ctx.translate(this.x, this.y - 7.5);
+      renderer.drawSprite(ctx, 'parachute');
+      ctx.restore();
+    }
+
+    // Barrel (hlaven) rotated around (x, y - 1)
+    ctx.save();
+    ctx.translate(this.x, this.y - 1);
+    ctx.rotate((this.rotace * Math.PI) / 180);
+    renderer.drawSprite(ctx, 'hlaven', { frame: this.barrelFrame });
+    ctx.restore();
+
+    // Tank body with player color tint
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    renderer.drawSprite(ctx, 'tank', {
+      frame: 0,
+      overrides: {
+        col: { cx: rgbToCx(this.data.col) },
+      },
+    });
+    ctx.restore();
+
+    // Active shield bubble
+    if (this.shActive && this.shieldSprite) {
+      const alpha = Math.max(0.08, Math.min(1, this.shieldEnergy / (this.shieldMax || 1)));
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      renderer.drawSprite(ctx, this.shieldSprite, { cx: alphaCx(alpha) });
+      ctx.restore();
+    }
+  }
+}

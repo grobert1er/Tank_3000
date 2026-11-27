@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tanks — Tank 3000</title>
+  <link rel="stylesheet" href="css/style.css?v=2">
+</head>
+<body>
+  <div id="app">
+    <header id="top-bar">
+      <div class="bar-left">
+        <span class="brand">TANKS</span>
+        <span id="status-pill" class="pill">Loading...</span>
+      </div>
+      <div class="bar-right">
+        <button id="btn-local" class="bar-btn" type="button" title="Return to Local Title Screen">Local Game</button>
+        <button id="btn-online" class="bar-btn accent" type="button" title="Play Online / LAN Multiplayer">Online Lobby</button>
+        <button id="btn-controls" class="bar-btn" type="button">Controls</button>
+        <button id="btn-mute" class="bar-btn" type="button">🔊 Sound</button>
+        <button id="btn-fullscreen" class="bar-btn" type="button" title="Toggle Fullscreen">⛶</button>
+      </div>
+    </header>
+
+    <main id="stage-wrap">
+      <canvas id="game-canvas" width="550" height="400"></canvas>
+    </main>
+  </div>
+
+  <!-- Online / LAN Multiplayer Lobby Modal -->
+  <div id="lobby-modal" class="modal-backdrop" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>Online / LAN Multiplayer</h2>
+        <button type="button" class="close-btn" data-close-modal>&times;</button>
+      </div>
+      <div id="lobby-error" class="error-banner" hidden></div>
+
+      <div id="lobby-entry">
+        <div class="field">
+          <label for="lobby-name">Your Name</label>
+          <input id="lobby-name" type="text" maxlength="14" placeholder="Commander" value="Player 1">
+        </div>
+        <div class="field">
+          <label for="lobby-transport">Connection Mode</label>
+          <select id="lobby-transport" class="full-select">
+            <option value="p2p" selected>Online P2P (WebRTC — No Server Needed)</option>
+            <option value="ws">Local / LAN Server (WebSocket)</option>
+          </select>
+        </div>
+        <div class="entry-actions">
+          <button id="btn-create-room" type="button" class="primary-btn">Create Room</button>
+          <div class="join-group">
+            <input id="lobby-code" type="text" maxlength="6" placeholder="CODE" style="text-transform:uppercase">
+            <button id="btn-join-room" type="button" class="secondary-btn">Join Room</button>
+          </div>
+        </div>
+        <p id="lobby-hint" class="hint">
+          <strong>Online P2P</strong> connects browsers directly via WebRTC — works on GitHub Pages, Netlify, Cloudflare Pages, or locally with zero backend server. Create a room and send the invite link or 4-letter code to friends.
+        </p>
+      </div>
+
+      <div id="lobby-room" hidden>
+        <div class="room-header">
+          <div>
+            <span class="room-label">ROOM CODE</span>
+            <span id="room-code-display" class="room-code">----</span>
+          </div>
+          <button id="btn-copy-invite" type="button" class="secondary-btn small">Copy Invite Link</button>
+        </div>
+
+        <div class="room-settings">
+          <label for="room-terrain">Terrain:</label>
+          <select id="room-terrain">
+            <option value="0">Random</option>
+            <option value="1">Mountains (Snow)</option>
+            <option value="2">Forest (Grass)</option>
+            <option value="3">Desert (Sand)</option>
+          </select>
+          <button id="btn-add-bot" type="button" class="secondary-btn small">+ Add Bot</button>
+        </div>
+
+        <div id="room-slots" class="slots-list"></div>
+
+        <div class="room-footer">
+          <button id="btn-leave-room" type="button" class="secondary-btn">Leave Room</button>
+          <button id="btn-start-online" type="button" class="primary-btn">Start Match</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Controls Modal -->
+  <div id="controls-modal" class="modal-backdrop" hidden>
+    <div class="modal-card compact">
+      <div class="modal-head">
+        <h2>Controls</h2>
+        <button type="button" class="close-btn" data-close-modal>&times;</button>
+      </div>
+      <table class="controls-table">
+        <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>Move tank (uses fuel) / Flip Air Strike direction</td></tr>
+        <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>Rotate cannon angle (or drag HUD slider)</td></tr>
+        <tr><td><kbd>PgUp</kbd> / <kbd>PgDn</kbd> or <kbd>W</kbd> / <kbd>S</kbd></td><td>Adjust fire power (or drag HUD bar)</td></tr>
+        <tr><td><kbd>Q</kbd> / <kbd>E</kbd></td><td>Cycle weapons (or click HUD arrows)</td></tr>
+        <tr><td><kbd>Space</kbd></td><td>Fire weapon (or click HUD Fire button)</td></tr>
+        <tr><td>Mouse HUD</td><td>Repair, Parachutes, Teleport, Shields flyout, Shop</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <script src="js/vendor/peerjs.min.js?v=2"></script>
+  <script type="module" src="js/main.js?v=2"></script>
+</body>
+</html>
