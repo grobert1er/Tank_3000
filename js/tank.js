@@ -166,7 +166,7 @@ export class Tank {
     this.shieldEnergy -= absorbed;
 
     if (absorbed > 0 && attacker && attacker !== this) {
-      const pts = Math.round(absorbed * 50);
+      const pts = Math.round(absorbed * 25);
       attacker.data.score += pts;
       attacker.data.total_score += pts;
     }
@@ -197,19 +197,19 @@ export class Tank {
       return;
     }
 
-    const prevEnergy = this.data.energy;
-    const actualDmg = Math.min(prevEnergy, Math.max(0, rawDam * armor));
-    if (actualDmg <= 0) return;
+    const prevEnergy = Math.round(this.data.energy);
+    if (prevEnergy <= 0) return;
+    const dmgAfterArmor = Math.max(1, Math.round(rawDam * armor));
+    const actualDmg = Math.min(prevEnergy, dmgAfterArmor);
 
     this.data.energy = Math.max(0, prevEnergy - actualDmg);
-    const roundedDmg = Math.round(actualDmg);
     const killed = this.data.energy <= 0;
     if (killed) {
       this.data.energy = 0;
     }
 
     if (attacker && attacker !== this) {
-      const dmgPts = roundedDmg * 100;
+      const dmgPts = actualDmg * 100;
       attacker.data.score += dmgPts;
       attacker.data.total_score += dmgPts;
       if (killed) {
@@ -218,7 +218,7 @@ export class Tank {
         attacker.data.total_score += 5000;
       }
     } else {
-      const selfDmg = isFall ? roundedDmg / 3 : roundedDmg;
+      const selfDmg = isFall ? actualDmg / 3 : actualDmg;
       const penalty = Math.round(selfDmg * 50) + (killed ? 2000 : 0);
       if (killed) this.data.kills -= 1;
       this.data.score = Math.max(0, this.data.score - penalty);
@@ -289,6 +289,8 @@ export class Tank {
   // Ground/falling physics loop shared between playing and testing states
   _stepGroundPhysics(game, isTesting) {
     const terrain = game.terrain;
+    // Skip fall damage during initial round spawn settling (before Turn 1 starts)
+    const allowFallDmg = !isTesting || Boolean(game.activeTank);
     // Attribute crater-induced fall damage during settling to the active shooter
     const fallAttacker = isTesting && game.activeTank && game.activeTank !== this ? game.activeTank : this;
     if (!isTesting) {
@@ -306,7 +308,7 @@ export class Tank {
         if (this.parOut) {
           this.parOut = false;
         }
-        if (this.fall > 0.4) {
+        if (allowFallDmg && this.fall > 0.4) {
           if (this.fall < 0.8) {
             this.damage(Math.round(this.fall * 25), fallAttacker, true);
           } else {
@@ -372,7 +374,7 @@ export class Tank {
         // Frame 9: carve death crater and damage nearby tanks (exact Sprite 31 Frame 9)
         game.terrain.carveTankDeath(this.x, this.y, TANK_DEATH_EXPL_W, TANK_DEATH_EXPL_H);
         for (const other of game.tanks) {
-          if (other.tankNumber === this.tankNumber || !other.data.live) continue;
+          if (other.tankNumber === this.tankNumber || !other.data.live || other.data.energy <= 0) continue;
           if (other.hitTestExplosion(this.x, this.y, TANK_DEATH_EXPL_W / 2, TANK_DEATH_EXPL_H / 2)) {
             const dx = this.x - other.x;
             const dy = this.y - other.y;
@@ -380,7 +382,6 @@ export class Tank {
             let damg;
             if (!other.shActive) {
               damg = Math.round(TANK_DEATH_EXPL_W / ((vzd + 1) / 14));
-              if (other.data.energy < damg) damg = other.data.energy;
             } else {
               damg = Math.round(TANK_DEATH_EXPL_W / ((vzd / 2 + 1) / 18));
             }

@@ -71,7 +71,7 @@ export class Projectile {
     }
 
     for (const tank of game.tanks) {
-      if (!tank.data.live) continue;
+      if (!tank.data.live || tank.data.energy <= 0) continue;
       if (tank.hitTestExplosion(this.x, this.y, s.f6w / 2, s.f6h / 2)) {
         const dx = this.x - tank.x;
         const dy = this.y - tank.y;
@@ -79,7 +79,6 @@ export class Projectile {
         let damg;
         if (!tank.shActive) {
           damg = Math.round(s.f6w / ((vzd + 1) / s.par4));
-          if (tank.data.energy < damg) damg = tank.data.energy;
         } else {
           damg = Math.round(s.f6w / ((vzd / 2 + 1) / s.par5));
         }
@@ -205,7 +204,7 @@ export class Projectile {
 
     // Tank / shield collision check
     for (const tank of game.tanks) {
-      if (!tank.data.live) continue;
+      if (!tank.data.live || tank.data.energy <= 0) continue;
       if (this.noWind) {
         // Air strike amissile hits any tank/shield directly
         if (tank.hitTestProjectile(this.x, this.y, 1.5, 1.5, true)) {

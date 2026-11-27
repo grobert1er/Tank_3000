@@ -279,7 +279,7 @@ export class TankGame {
     );
     this.turnIdx = 0;
     this.nextTank = this.turnOrder[0] || null;
-    this.activeTank = this.turnOrder[0] || null;
+    this.activeTank = null;
     this.aliveCount = this.playerCount;
 
     // Settle all tanks before starting the first turn
@@ -1948,15 +1948,15 @@ export class TankGame {
 
   _renderPanel(ctx) {
     const renderer = this.renderer;
-    const t = this.activeTank || this.tanks[0];
+    const t = this.activeTank || this.nextTank || this.tanks[0];
     if (!t) return;
     const pd = t.data;
     const isHumanCtrl = this.canLocalControl();
     const curWeapon = WEAPONS[pd.cur_gun] || WEAPONS[0];
     const gunCount = pd.guns[pd.cur_gun] ?? 0;
 
-    // Compute sorted scoreboard order (descending by total_score, matching panel.sort_score())
-    const ranked = [...this.playerData].sort((a, b) => b.total_score - a.total_score);
+    // Compute sorted scoreboard order (descending by total_score, deterministic tie-break)
+    const ranked = [...this.playerData].sort((a, b) => b.total_score - a.total_score || a.t_num - b.t_num);
     const scoreYs = [28.3, 42.45, 56.6, 70.75, 84.9];
 
     ctx.save();
