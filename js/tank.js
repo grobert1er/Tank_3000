@@ -155,20 +155,36 @@ export class Tank {
     this.shieldSprite = null;
   }
 
-  // Exact shield.damage(dam, attacker) from Sprites 311/313/315/317
+  // Shield absorption: awards fair score for shield damage and passes 1x overflow to hull
   damageShield(dam, attacker) {
-    this.shieldEnergy -= dam;
+    if (!this.data.live || this.data.energy <= 0) return;
+    const rawDam = Math.max(0, Math.round(dam));
+    if (rawDam <= 0) return;
+
+    const absorbed = Math.min(this.shieldEnergy, rawDam);
+    const overflow = Math.max(0, rawDam - this.shieldEnergy);
+    this.shieldEnergy -= absorbed;
+
+    if (absorbed > 0 && attacker && attacker !== this) {
+      const pts = Math.round(absorbed * 50);
+      attacker.data.score += pts;
+      attacker.data.total_score += pts;
+    }
+
     if (this.shieldEnergy <= 0) {
-      const overflow = Math.abs(this.shieldEnergy) * 2;
       this.disableShield();
-      // Pass remaining overflow damage directly to tank body (shActive is now false)
-      this.damage(overflow, attacker, false);
+      if (overflow > 0) {
+        this.damage(overflow, attacker, false);
+      }
     }
   }
 
-  // Exact damage(damag, attacker, par) from Sprite 31 Frame 1 lines 118-161
+  // Apply hull damage, armor reduction, and accurate cash/score accounting (no overkill or double-kill)
   damage(damag, attacker, isFall = false) {
-    if (!this.data.live) return;
+    if (!this.data.live || this.data.energy <= 0) return;
+    const rawDam = Math.max(0, damag);
+    if (rawDam <= 0) return;
+
     let armor = 1;
     let arm = 1;
     for (let i = 0; i < this.data.specials[9]; i++) {
@@ -176,34 +192,37 @@ export class Tank {
       arm = arm / 1.0002;
     }
 
-    if (!this.shActive || isFall) {
-      this.data.energy = this.data.energy - damag * armor;
-    } else {
-      this.damageShield(damag, attacker);
+    if (this.shActive && !isFall) {
+      this.damageShield(rawDam, attacker);
       return;
     }
 
-    if (this.data.energy <= 0) {
-      if (attacker && attacker !== this) {
-        attacker.data.kills += 1;
-        attacker.data.score += 5000;
-        attacker.data.total_score += 5000;
-      } else {
-        this.data.kills -= 1;
-        this.data.score -= 2000;
-        this.data.total_score -= 2000;
-      }
+    const prevEnergy = this.data.energy;
+    const actualDmg = Math.min(prevEnergy, Math.max(0, rawDam * armor));
+    if (actualDmg <= 0) return;
+
+    this.data.energy = Math.max(0, prevEnergy - actualDmg);
+    const roundedDmg = Math.round(actualDmg);
+    const killed = this.data.energy <= 0;
+    if (killed) {
+      this.data.energy = 0;
     }
 
     if (attacker && attacker !== this) {
-      attacker.data.score += damag * 100;
-      attacker.data.total_score += damag * 100;
+      const dmgPts = roundedDmg * 100;
+      attacker.data.score += dmgPts;
+      attacker.data.total_score += dmgPts;
+      if (killed) {
+        attacker.data.kills += 1;
+        attacker.data.score += 5000;
+        attacker.data.total_score += 5000;
+      }
     } else {
-      let selfDmg = damag;
-      if (isFall) selfDmg = selfDmg / 3;
-      this.data.score -= Math.round(selfDmg * 50);
-      this.data.total_score -= Math.round(selfDmg * 50);
-      if (this.data.score < 0) this.data.score = 0;
+      const selfDmg = isFall ? roundedDmg / 3 : roundedDmg;
+      const penalty = Math.round(selfDmg * 50) + (killed ? 2000 : 0);
+      if (killed) this.data.kills -= 1;
+      this.data.score = Math.max(0, this.data.score - penalty);
+      this.data.total_score = Math.max(0, this.data.total_score - penalty);
     }
   }
 
@@ -267,8 +286,11 @@ export class Tank {
     return false;
   }
 
-  // Exact ground/falling physics loop shared between playing and testing states
-  _stepGroundPhysics(terrain, isTesting) {
+  // Ground/falling physics loop shared between playing and testing states
+  _stepGroundPhysics(game, isTesting) {
+    const terrain = game.terrain;
+    // Attribute crater-induced fall damage during settling to the active shooter
+    const fallAttacker = isTesting && game.activeTank && game.activeTank !== this ? game.activeTank : this;
     if (!isTesting) {
       this.naZemi = false;
       this.left = true;
@@ -281,34 +303,18 @@ export class Tank {
     for (let i = 0; i < TANK_WIDTH; i++) {
       const col = terrain.getCol(Math.round(this.x - TANK_HALF_W + i));
       if (col && this.pasyHitCol(col)) {
-        if (!isTesting) {
-          this.naZemi = true;
-          if (this.parOut) {
-            this.parOut = false;
-          }
-          if (this.fall > 0.4) {
-            const threshold = this.type === 'ai' ? 0.8 : 2.0;
-            if (this.fall < threshold) {
-              this.damage(Math.round(this.fall * 25), this, true);
-            } else {
-              this.damage(Math.round(this.fall * this.fall * 3000), this, true);
-            }
-          }
-          this.fall = 0;
-        } else {
-          if (this.fall > 0.4) {
-            if (this.fall < 0.8) {
-              this.damage(Math.round(this.fall * 25), this, true);
-            } else {
-              this.damage(Math.round(this.fall * this.fall * 80), this, true);
-            }
-          }
-          if (this.parOut) {
-            this.parOut = false;
-          }
-          this.naZemi = true;
-          this.fall = 0;
+        if (this.parOut) {
+          this.parOut = false;
         }
+        if (this.fall > 0.4) {
+          if (this.fall < 0.8) {
+            this.damage(Math.round(this.fall * 25), fallAttacker, true);
+          } else {
+            this.damage(Math.round(this.fall * this.fall * 80), fallAttacker, true);
+          }
+        }
+        this.naZemi = true;
+        this.fall = 0;
       }
 
       if (col) {
@@ -395,9 +401,12 @@ export class Tank {
 
     // Check fell off bottom of screen (y > 400)
     if (this.y > STAGE_H) {
+      const killer = game.activeTank && game.activeTank !== this ? game.activeTank : this;
+      if (this.data.energy > 0) {
+        this.damage(99999, killer, true);
+      }
       this.data.live = false;
       this.data.energy = 0;
-      this.data.score = Math.max(0, this.data.score - 2000);
       this._beginDeath(game);
       return;
     }
@@ -425,7 +434,7 @@ export class Tank {
         return;
       }
 
-      this._stepGroundPhysics(game.terrain, false);
+      this._stepGroundPhysics(game, false);
 
       // Power up/down (PageUp / PageDown + W/S aliases)
       if (input.powerUp && this.power < 100 && this.power < this.data.energy) {
@@ -454,7 +463,7 @@ export class Tank {
       }
     } else if (this.playing && this.type === 'ai') {
       // Ground physics during AI turn
-      this._stepGroundPhysics(game.terrain, false);
+      this._stepGroundPhysics(game, false);
       if (this.power > this.data.energy) {
         this.power = this.data.energy;
       }
@@ -462,7 +471,7 @@ export class Tank {
 
     // Settling / falling check phase (testing == true)
     if (this.testing) {
-      this._stepGroundPhysics(game.terrain, true);
+      this._stepGroundPhysics(game, true);
       if (this.fall > 0.001) {
         this.test = false;
       }
