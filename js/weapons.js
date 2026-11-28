@@ -45,6 +45,9 @@ export class Projectile {
       this.vox = Math.cos((Math.PI / 180) * this.uhel) * this.vo;
       this.voy = Math.sin(0.017 * this.uhel) * this.vo;
     }
+    // Point projectile accurately along its initial launch vector from frame 0
+    this.angleRad = Math.atan2(-this.voy, this.vox);
+    this.trailRibbon = null;
 
     this.hit = true; // true until projectile exits owner tank/shield
     this.frame = 1; // 1 = flying, 2..12 = exploding
@@ -66,12 +69,43 @@ export class Projectile {
     this.smer = null; // 'left' | 'right'
   }
 
+  _ensureRibbon(game, firstX = null, firstY = null) {
+    if (this.trailRibbon || !game.vfx) return this.trailRibbon;
+    const isNuke = this.spec.f6w >= 150;
+    const isHeavy = this.spec.f6w >= 85;
+    const isWarm = this.spec.kind === 'death' || this.spec.kind === 'funky' || this.spec.spriteId === 49;
+    this.trailRibbon = game.vfx.createTrailRibbon({
+      isNuke,
+      isHeavy,
+      col: isWarm ? '#ffedd5' : '#ffffff',
+      emberCol: isNuke ? '#f97316' : '#fb923c',
+    });
+    // Monotonic anchor strictly behind the first tail point (never folds backwards on low-power shots!)
+    if (firstX !== null && firstY !== null) {
+      const dx = firstX - this.x0;
+      const dy = firstY - this.y0;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 1) {
+        const back = Math.min(dist * 0.65, 5);
+        game.vfx.pushTrailPoint(this.trailRibbon, this.x0 + (dx / dist) * (dist - back), this.y0 + (dy / dist) * (dist - back), false);
+      } else {
+        game.vfx.pushTrailPoint(this.trailRibbon, this.x0, this.y0, false);
+      }
+    } else {
+      game.vfx.pushTrailPoint(this.trailRibbon, this.x0, this.y0, false);
+    }
+    return this.trailRibbon;
+  }
+
   _startExplosion(game) {
     if (this.exploding) return;
     this.exploding = true;
     this.first = false;
     this.second = false;
     this.frame = 2;
+    if (this.trailRibbon) {
+      game.vfx?.finishTrailRibbon(this.trailRibbon, this.x, this.y);
+    }
     game.vfx?.spawnExplosion(this.x, this.y, this.spec.f6w, this.spec.kind || 'missile');
     game.sound.play(this.spec.soundId, { volume: 0.9, minIntervalMs: 30 });
   }
@@ -130,6 +164,9 @@ export class Projectile {
   // Shower (5 missile_funky) and Hot shower (7 bnuke_c) auto-split cleanly just past arc apex
   _spawnShowerSubs(game, count, subKey) {
     this.hasSplit = true;
+    if (this.trailRibbon) {
+      game.vfx?.finishTrailRibbon(this.trailRibbon, this.x, this.y);
+    }
     this.expectedSubs = count;
     this.subDone = new Array(count).fill(false);
     const half = Math.floor(count / 2); // 2 for Shower(5), 3 for Hot shower(7)
@@ -163,6 +200,9 @@ export class Projectile {
 
   _finish(game) {
     this.done = true;
+    if (this.trailRibbon) {
+      game.vfx?.finishTrailRibbon(this.trailRibbon, this.x, this.y);
+    }
     if (this.isSub && this.parentProj) {
       this.parentProj.subDone[this.subIndex] = true;
     } else if (!this.isSub) {
@@ -252,9 +292,14 @@ export class Projectile {
     if (this.isRoller) {
       this.prevX = this.x;
       this.prevY = this.y;
+      const wasAirborne = this.first;
       this._tickRoller(game);
-      if (this.first) {
-        game.vfx?.spawnTrail(this.x, this.y, this.spec.f6w >= 90, 'rgba(255,255,255,0.62)');
+      if (wasAirborne && this.t > 0.1) {
+        const rib = this._ensureRibbon(game);
+        game.vfx?.pushTrailPoint(rib, this.x, this.y, true);
+        if (!this.first && rib) {
+          game.vfx?.finishTrailRibbon(rib, this.x, this.y);
+        }
       }
       return;
     }
@@ -269,11 +314,14 @@ export class Projectile {
     if (dx * dx + dy * dy > 0.01) {
       this.angleRad = Math.atan2(dy, dx);
     }
-    const isHeavy = this.spec.f6w >= 90;
-    const trailCol = this.spec.kind === 'death' || this.spec.kind === 'funky'
-      ? 'rgba(251, 146, 60, 0.55)'
-      : 'rgba(255, 255, 255, 0.68)';
-    game.vfx?.spawnTrail(this.x, this.y, isHeavy, trailCol);
+    if (this.t > 0) {
+      // Emit contrail from the thruster tail behind the warhead
+      const tailOff = this.spec.f6w >= 150 ? 3.8 : this.spec.f6w >= 85 ? 3.0 : 2.2;
+      const tx = this.x - Math.cos(this.angleRad) * tailOff;
+      const ty = this.y - Math.sin(this.angleRad) * tailOff;
+      const rib = this._ensureRibbon(game, tx, ty);
+      game.vfx?.pushTrailPoint(rib, tx, ty, true);
+    }
     if (!this.noWind) {
       this.vox += game.terrain.vitr / 600;
     }

@@ -7,17 +7,20 @@ import { STAGE_W, STAGE_H } from './constants.js';
 export class VfxManager {
   constructor() {
     this.explosions = []; // { x, y, maxR, frame, maxFrames, coreCol, ringCol }
-    this.trails = [];     // { x, y, vx, vy, r, alpha, col, life, maxLife }
+    this.ribbons = [];    // continuous tapered projectile contrails
+    this.trails = [];     // soft wispy smoke puffs
     this.sparks = [];     // { x, y, vx, vy, r, col, life, maxLife }
     this.popups = [];     // { x, y, vy, text, color, life, maxLife, scale }
     this.weather = [];    // ambient particles across viewport
     this.weatherKrajina = 0;
     this.shakeFrames = 0;
     this.shakeMag = 0;
+    this._nextRibbonId = 1;
   }
 
   clearBattleFx() {
     this.explosions = [];
+    this.ribbons = [];
     this.trails = [];
     this.sparks = [];
     this.popups = [];
@@ -68,19 +71,74 @@ export class VfxManager {
     }
   }
 
-  spawnTrail(x, y, isHeavy = false, col = 'rgba(255,255,255,0.68)') {
+  // Create a continuous tapered contrail ribbon for a projectile
+  createTrailRibbon(opts = {}) {
+    const isNuke = Boolean(opts.isNuke);
+    const isHeavy = Boolean(opts.isHeavy);
+    const ribbon = {
+      id: this._nextRibbonId++,
+      points: [],
+      width: isNuke ? 4.2 : isHeavy ? 3.1 : 2.2,
+      maxLife: isNuke ? 38 : isHeavy ? 32 : 26,
+      col: opts.col || '#ffffff',
+      edgeCol: opts.edgeCol || 'rgba(15, 23, 42, 0.14)',
+      emberCol: opts.emberCol || '#fb923c',
+      isHeavy: isHeavy || isNuke,
+      finished: false,
+      stepCount: 0,
+    };
+    this.ribbons.push(ribbon);
+    if (this.ribbons.length > 48) {
+      this.ribbons.shift();
+    }
+    return ribbon;
+  }
+
+  pushTrailPoint(ribbon, x, y, emitPuff = true) {
+    if (!ribbon || ribbon.finished) return;
+    const pts = ribbon.points;
+    const last = pts.length ? pts[pts.length - 1] : null;
+    if (last) {
+      const dx = x - last.x;
+      const dy = y - last.y;
+      if (dx * dx + dy * dy < 0.25) return;
+    }
+    pts.push({ x, y, life: 0, maxLife: ribbon.maxLife });
+    ribbon.stepCount++;
+
+    // Subtle wispy Paper-Cut puff spaced cleanly along the exhaust wake
+    if (emitPuff && ribbon.stepCount >= 3 && ribbon.stepCount % 3 === 0 && last) {
+      const mx = (last.x + x) * 0.5;
+      const my = (last.y + y) * 0.5;
+      this.spawnTrail(mx, my, ribbon.isHeavy, ribbon.col === '#ffffff' ? 'rgba(255,255,255,0.34)' : 'rgba(254,215,170,0.34)');
+    }
+  }
+
+  finishTrailRibbon(ribbon, finalX = null, finalY = null) {
+    if (!ribbon || ribbon.finished) return;
+    if (finalX !== null && finalY !== null) {
+      const pts = ribbon.points;
+      const last = pts.length ? pts[pts.length - 1] : null;
+      if (!last || Math.hypot(finalX - last.x, finalY - last.y) > 0.5) {
+        pts.push({ x: finalX, y: finalY, life: 0, maxLife: ribbon.maxLife });
+      }
+    }
+    ribbon.finished = true;
+  }
+
+  spawnTrail(x, y, isHeavy = false, col = 'rgba(255,255,255,0.45)') {
     this.trails.push({
-      x: x + (Math.random() - 0.5) * 1.2,
-      y: y + (Math.random() - 0.5) * 1.2,
-      vx: (Math.random() - 0.5) * 0.15,
-      vy: -0.12 - Math.random() * 0.12,
-      r: isHeavy ? 2.8 : 1.9,
+      x: x + (Math.random() - 0.5) * 0.8,
+      y: y + (Math.random() - 0.5) * 0.8,
+      vx: (Math.random() - 0.5) * 0.1,
+      vy: -0.09 - Math.random() * 0.08,
+      r: isHeavy ? 2.4 : 1.5,
       col,
       life: 0,
-      maxLife: isHeavy ? 18 : 13,
+      maxLife: isHeavy ? 18 : 14,
     });
-    if (this.trails.length > 180) {
-      this.trails.splice(0, this.trails.length - 180);
+    if (this.trails.length > 160) {
+      this.trails.splice(0, this.trails.length - 160);
     }
   }
 
@@ -143,12 +201,30 @@ export class VfxManager {
       if (e.frame >= e.maxFrames) this.explosions.splice(i, 1);
     }
 
+    // Continuous contrail ribbons (gentle wind drift + smooth tail fade)
+    for (let i = this.ribbons.length - 1; i >= 0; i--) {
+      const r = this.ribbons[i];
+      for (const pt of r.points) {
+        pt.life++;
+        // Drift older points very softly so exhaust curves naturally in wind
+        const ageFrac = pt.life / pt.maxLife;
+        pt.x += vitr * 0.0022 * ageFrac;
+        pt.y -= 0.035 * ageFrac;
+      }
+      while (r.points.length && r.points[0].life >= r.points[0].maxLife) {
+        r.points.shift();
+      }
+      if (r.finished && r.points.length < 2) {
+        this.ribbons.splice(i, 1);
+      }
+    }
+
     // Smoke trails
     for (let i = this.trails.length - 1; i >= 0; i--) {
       const tr = this.trails[i];
-      tr.x += tr.vx + vitr * 0.004;
+      tr.x += tr.vx + vitr * 0.003;
       tr.y += tr.vy;
-      tr.r += 0.1;
+      tr.r += 0.09;
       tr.life++;
       if (tr.life >= tr.maxLife) this.trails.splice(i, 1);
     }
@@ -231,13 +307,62 @@ export class VfxManager {
     ctx.restore();
   }
 
-  renderBattleFx(ctx) {
-    // 1. Soft smoke trails
+  // Helper: build a single closed bead-free tapered ribbon polygon from polyline points
+  _traceTaperedRibbon(ctx, pts, widthScale = 1, startIdx = 0) {
+    const n = pts.length;
+    const count = n - startIdx;
+    if (count < 2) return false;
+
+    const leftX = new Array(count);
+    const leftY = new Array(count);
+    const rightX = new Array(count);
+    const rightY = new Array(count);
+
+    for (let k = 0; k < count; k++) {
+      const i = startIdx + k;
+      const p = pts[i];
+      const pPrev = pts[Math.max(startIdx, i - 1)];
+      const pNext = pts[Math.min(n - 1, i + 1)];
+      let tx = pNext.x - pPrev.x;
+      let ty = pNext.y - pPrev.y;
+      const len = Math.hypot(tx, ty) || 1;
+      tx /= len;
+      ty /= len;
+      // Perpendicular normal
+      const nx = -ty;
+      const ny = tx;
+
+      const lifeFrac = Math.max(0, 1 - p.life / p.maxLife);
+      const posFrac = k / (count - 1);
+      // Smooth teardrop taper: 0px at tail -> full width right behind rocket thruster
+      const hw = widthScale * Math.pow(posFrac, 0.85) * Math.pow(lifeFrac, 0.65);
+
+      leftX[k] = p.x + nx * hw;
+      leftY[k] = p.y + ny * hw;
+      rightX[k] = p.x - nx * hw;
+      rightY[k] = p.y - ny * hw;
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(leftX[0], leftY[0]);
+    for (let k = 1; k < count; k++) {
+      ctx.lineTo(leftX[k], leftY[k]);
+    }
+    for (let k = count - 1; k >= 0; k--) {
+      ctx.lineTo(rightX[k], rightY[k]);
+    }
+    ctx.closePath();
+    return true;
+  }
+
+  // Rendered BEHIND projectiles so the rocket nose & body stay crisp above its exhaust
+  renderTrails(ctx) {
+    // 1. Subtle wispy exhaust puffs
     if (this.trails.length) {
       ctx.save();
       for (const tr of this.trails) {
         const a = Math.max(0, 1 - tr.life / tr.maxLife);
-        ctx.globalAlpha = a * 0.65;
+        ctx.globalAlpha = a * 0.38;
         ctx.fillStyle = tr.col;
         ctx.beginPath();
         ctx.arc(tr.x, tr.y, tr.r, 0, Math.PI * 2);
@@ -246,7 +371,57 @@ export class VfxManager {
       ctx.restore();
     }
 
-    // 2. Clean Paper-Cut shockwave ring explosions
+    // 2. Smooth continuous bead-free tapered Paper-Cut contrail ribbons
+    if (!this.ribbons.length) return;
+    ctx.save();
+
+    for (const r of this.ribbons) {
+      const pts = r.points;
+      const n = pts.length;
+      if (n < 2) continue;
+
+      const newest = pts[n - 1];
+      const headLife = Math.max(0, 1 - newest.life / newest.maxLife);
+      if (headLife <= 0.02) continue;
+
+      const halfW = r.width * 0.5;
+
+      // Subtle contrast outline so white contrails stay crisp over Snow Mountains too
+      if (this._traceTaperedRibbon(ctx, pts, halfW + 0.75, 0)) {
+        ctx.globalAlpha = headLife * 0.24;
+        ctx.fillStyle = r.edgeCol;
+        ctx.fill();
+      }
+
+      // Crisp Paper-Cut main contrail body (single filled polygon -> zero overlapping alpha dots!)
+      if (this._traceTaperedRibbon(ctx, pts, halfW, 0)) {
+        ctx.globalAlpha = headLife * 0.86;
+        ctx.fillStyle = r.col;
+        ctx.fill();
+      }
+
+      // Warm glowing rocket jet directly behind an active flying projectile
+      if (!r.finished && n >= 2) {
+        const jetStart = Math.max(0, n - 5);
+        if (this._traceTaperedRibbon(ctx, pts, halfW * 0.65, jetStart)) {
+          ctx.globalAlpha = headLife * 0.82;
+          ctx.fillStyle = r.emberCol;
+          ctx.fill();
+        }
+        const coreStart = Math.max(0, n - 3);
+        if (this._traceTaperedRibbon(ctx, pts, halfW * 0.38, coreStart)) {
+          ctx.globalAlpha = headLife * 0.92;
+          ctx.fillStyle = '#fde047';
+          ctx.fill();
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  // Rendered ABOVE projectiles (shockwaves, sparks, floating popups)
+  renderBattleFx(ctx) {
+    // 1. Clean Paper-Cut shockwave ring explosions
     if (this.explosions.length) {
       ctx.save();
       for (const e of this.explosions) {

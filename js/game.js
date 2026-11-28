@@ -1950,12 +1950,15 @@ export class TankGame {
       ctx.restore();
     }
 
-    // 4. Projectiles
+    // 4. Continuous Paper-Cut projectile contrails (rendered BEHIND rockets)
+    this.vfx.renderTrails(ctx);
+
+    // 5. Projectiles
     for (const proj of this.projectiles) {
       proj.render(ctx);
     }
 
-    // 5. Shockwave rings, smoke trails, sparks & floating damage/bounty popups
+    // 6. Shockwave rings, sparks & floating damage/bounty popups
     this.vfx.renderBattleFx(ctx);
 
     // 6. Teleport reticle / shimmer beam
