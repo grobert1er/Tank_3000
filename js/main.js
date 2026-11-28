@@ -1772,10 +1772,17 @@ async function boot() {
     return [sx, sy];
   }
 
+  function updateCanvasCursor() {
+    if (game.cursorHidden) canvas.style.cursor = 'none';
+    else if (game.draggingAngle) canvas.style.cursor = 'grabbing';
+    else if (game.hoveringTankAim) canvas.style.cursor = 'grab';
+    else canvas.style.cursor = 'default';
+  }
+
   canvas.addEventListener('pointermove', (ev) => {
     const [sx, sy] = toStageCoords(ev);
     game.handleMouseMove(sx, sy);
-    canvas.style.cursor = game.cursorHidden ? 'none' : 'default';
+    updateCanvasCursor();
   });
 
   canvas.addEventListener('pointerdown', (ev) => {
@@ -1784,12 +1791,24 @@ async function boot() {
     }
     const [sx, sy] = toStageCoords(ev);
     game.handleMouseDown(sx, sy);
+    if (game.draggingAngle) {
+      canvas.setPointerCapture?.(ev.pointerId);
+    }
+    updateCanvasCursor();
   });
 
   canvas.addEventListener('pointerup', (ev) => {
     const [sx, sy] = toStageCoords(ev);
     game.handleMouseUp(sx, sy);
-    canvas.style.cursor = game.cursorHidden ? 'none' : 'default';
+    updateCanvasCursor();
+  });
+
+  canvas.addEventListener('pointercancel', () => {
+    if (game.draggingAngle) {
+      game.draggingAngle = false;
+      game.sound.stop(346);
+      updateCanvasCursor();
+    }
   });
 
   window.addEventListener('keydown', (ev) => {

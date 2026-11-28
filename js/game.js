@@ -79,9 +79,10 @@ export class TankGame {
     this._aiPendingTeleport = null;
     this.blik = null; // { x, y, frame, col }
 
-    // HUD interactive hold state
+    // HUD interactive hold & direct on-tank aim state
     this.shieldsMenuOpen = false;
     this.draggingAngle = false;
+    this.hoveringTankAim = false;
     this.holdingFuelLeft = false;
     this.holdingFuelRight = false;
 
@@ -760,6 +761,8 @@ export class TankGame {
     this.keys.fire = false;
     this.holdingFuelLeft = false;
     this.holdingFuelRight = false;
+    this.draggingAngle = false;
+    this.hoveringTankAim = false;
     this.sound.stop(SOUNDS.TURRET_MOVE);
 
     if (spec.kind === 'astrike') {
@@ -1797,10 +1800,41 @@ export class TankGame {
     for (const k of Object.keys(this.keys)) this.keys[k] = false;
     this.holdingFuelLeft = false;
     this.holdingFuelRight = false;
-    this.draggingAngle = false;
+    if (this.draggingAngle) {
+      this.draggingAngle = false;
+      this.sound.stop(SOUNDS.TURRET_MOVE);
+    }
+    this.hoveringTankAim = false;
   }
 
-  // Canvas pointer events are ONLY for Teleport & Air Strike destination targeting
+  _isNearActiveTank(sx, sy) {
+    if (!this.canLocalControl() || !this.activeTank) return false;
+    const t = this.activeTank;
+    const dx = sx - t.x;
+    const dy = sy - (t.y - 2);
+    return dx * dx + dy * dy <= 38 * 38;
+  }
+
+  _applyTankAimFromPointer(sx, sy) {
+    if (!this.canLocalControl() || !this.activeTank) return;
+    const t = this.activeTank;
+    const dx = sx - t.x;
+    const dy = sy - (t.y - 1.6);
+    if (dx * dx + dy * dy < 9) return; // dead-center grace zone
+    let deg;
+    if (dy >= 0) {
+      deg = dx < 0 ? 0 : 180;
+    } else {
+      deg = Math.round((Math.atan2(-dy, -dx) * 180) / Math.PI);
+    }
+    deg = Math.max(0, Math.min(180, deg));
+    if (deg !== t.rotace) {
+      t.rotace = deg;
+      this.sound.play(SOUNDS.TURRET_MOVE, { volume: 0.35, noMultiple: true });
+    }
+  }
+
+  // Canvas pointer events: Teleport, Air Strike targeting, and direct on-tank angle drag
   handleMouseMove(sx, sy) {
     this.mouseX = sx;
     this.mouseY = sy;
@@ -1813,6 +1847,18 @@ export class TankGame {
       this.teleport.cursorX = sx;
       this.teleport.cursorY = sy;
     }
+
+    if (this.draggingAngle) {
+      if (!this.canLocalControl()) {
+        this.draggingAngle = false;
+        this.sound.stop(SOUNDS.TURRET_MOVE);
+      } else {
+        this._applyTankAimFromPointer(sx, sy);
+        return;
+      }
+    }
+
+    this.hoveringTankAim = this._isNearActiveTank(sx, sy);
   }
 
   handleMouseDown(sx, sy) {
@@ -1823,6 +1869,13 @@ export class TankGame {
 
     if (this.scene === 'battle' && this.teleport && !this.teleport.picked && this.canLocalControlSpecialOverlay()) {
       this.confirmTeleport(sx, sy);
+      return;
+    }
+
+    if (this._isNearActiveTank(sx, sy)) {
+      this.draggingAngle = true;
+      this.hoveringTankAim = true;
+      this._applyTankAimFromPointer(sx, sy);
     }
   }
 
@@ -1830,6 +1883,13 @@ export class TankGame {
     this.mouseX = sx;
     this.mouseY = sy;
     this.mouseDown = false;
+
+    if (this.draggingAngle) {
+      this.draggingAngle = false;
+      this.sound.stop(SOUNDS.TURRET_MOVE);
+      this.hoveringTankAim = this._isNearActiveTank(sx, sy);
+      return;
+    }
 
     if (this.scene === 'battle' && this.airStrike && !this.airStrike.launched && this.canLocalControlSpecialOverlay()) {
       this.launchAirStrike(sx, this.airStrike.uhel);
@@ -1928,6 +1988,11 @@ export class TankGame {
       tank.render(ctx, this);
     }
 
+    // 2b. Direct on-tank mouse angle protractor & aim guide (hover or active drag)
+    if (this.canLocalControl() && this.activeTank && (this.draggingAngle || this.hoveringTankAim)) {
+      this._renderTankAimDial(ctx, this.activeTank, this.draggingAngle);
+    }
+
     // 3. Clean Paper-Cut turn-start bouncing chevron above active tank
     if (this.blik) {
       const f = this.blik.frame;
@@ -1970,6 +2035,88 @@ export class TankGame {
     if (this.airStrike) {
       this.airStrike.render(ctx);
     }
+  }
+
+  // Clean Paper-Cut semicircular protractor & dashed aim guide when hovering/dragging tank angle
+  _renderTankAimDial(ctx, t, isDragging) {
+    const px = t.x;
+    const py = t.y - 1.6;
+    const r = isDragging ? 29 : 23;
+    // rotace=0 -> left (Math.PI), rotace=90 -> up (1.5*Math.PI / -Math.PI/2), rotace=180 -> right (2*Math.PI)
+    const dirRad = Math.PI + (t.rotace * Math.PI) / 180;
+    const dx = Math.cos(dirRad);
+    const dy = Math.sin(dirRad);
+
+    ctx.save();
+    ctx.translate(px, py);
+
+    // Subtle frosted protractor dome
+    ctx.beginPath();
+    ctx.arc(0, 0, r, Math.PI, Math.PI * 2);
+    ctx.fillStyle = isDragging ? 'rgba(255, 255, 255, 0.22)' : 'rgba(255, 255, 255, 0.12)';
+    ctx.fill();
+
+    // Crisp outer semicircle arc
+    ctx.strokeStyle = isDragging ? 'rgba(2, 132, 199, 0.78)' : 'rgba(15, 23, 42, 0.32)';
+    ctx.lineWidth = isDragging ? 1.3 : 1.0;
+    ctx.setLineDash(isDragging ? [] : [3, 3]);
+    ctx.beginPath();
+    ctx.arc(0, 0, r, Math.PI, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    if (isDragging) {
+      // Degree tick marks every 30°
+      ctx.strokeStyle = 'rgba(15, 23, 42, 0.34)';
+      ctx.lineWidth = 0.85;
+      for (let d = 0; d <= 180; d += 30) {
+        const a = Math.PI + (d * Math.PI) / 180;
+        const inner = d % 90 === 0 ? r - 4.5 : r - 2.8;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a) * inner, Math.sin(a) * inner);
+        ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+        ctx.stroke();
+      }
+
+      // Crisp dashed aim ray along current firing direction
+      ctx.strokeStyle = 'rgba(2, 132, 199, 0.9)';
+      ctx.lineWidth = 1.4;
+      ctx.setLineDash([3.5, 2.8]);
+      ctx.beginPath();
+      ctx.moveTo(dx * 11, dy * 11);
+      ctx.lineTo(dx * (r + 18), dy * (r + 18));
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Aim handle dot on protractor rim
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = '#0284c7';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.arc(dx * r, dy * r, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      // Floating live degree pill cleanly positioned along aim ray
+      const bx = dx * (r + 25);
+      const by = dy * (r + 25);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.94)';
+      ctx.strokeStyle = 'rgba(2, 132, 199, 0.55)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(bx - 14, by - 6.5, 28, 13, 6.5);
+      else ctx.rect(bx - 14, by - 6.5, 28, 13);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#0f172a';
+      ctx.font = '800 7.5px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`${Math.round(t.rotace)}°`, bx, by + 0.3);
+    }
+
+    ctx.restore();
   }
 
   _notifyStatus() {
