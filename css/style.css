@@ -1741,13 +1741,14 @@ input[type="text"]:focus, select:focus {
 }
 
 .color-dot {
+  position: relative;
   width: 16px;
   height: 16px;
   border-radius: 50%;
   border: 2px solid #ffffff;
   box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.22);
   cursor: pointer;
-  transition: transform 0.1s ease;
+  transition: transform 0.1s ease, opacity 0.12s ease;
 }
 
 .color-dot.active {
@@ -1758,6 +1759,24 @@ input[type="text"]:focus, select:focus {
 .color-dot:disabled {
   cursor: default;
   opacity: 0.78;
+}
+
+.color-dot.taken {
+  opacity: 0.26;
+  cursor: not-allowed;
+  transform: scale(0.88);
+}
+
+.color-dot.taken::after {
+  content: '';
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  top: 50%;
+  height: 1.8px;
+  background: rgba(15, 23, 42, 0.72);
+  transform: translateY(-50%) rotate(-45deg);
+  border-radius: 2px;
 }
 
 .slot-right {

@@ -191,6 +191,24 @@ async def test_server_e2e():
         lob2 = await c2.recv_json()
         assert lob1["slots"][2]["name"] == "Bobby" and lob2["slots"][2]["name"] == "Bobby"
 
+        # Enforce unique tank colors across players & bots
+        host_col = lob1["slots"][0]["col"]
+        bob_orig_col = lob1["slots"][2]["col"]
+        assert len({s["col"] for s in lob1["slots"]}) == 3
+        await c2.send_json({"type": "update_profile", "col": host_col})
+        lob1 = await c1.recv_json()
+        lob2 = await c2.recv_json()
+        assert lob1["slots"][2]["col"] == bob_orig_col, "Guest should not be allowed to steal host's color"
+        await c1.send_json({"type": "host_config", "action": "set_slot_col", "index": 1, "col": host_col})
+        lob1 = await c1.recv_json()
+        lob2 = await c2.recv_json()
+        assert lob1["slots"][1]["col"] != host_col, "Bot should not be allowed to take host's color"
+        free_col = next(c for c in [0xF02400, 0x00CC33, 0x0033FF, 0x333333, 0xF0DF0F, 0xEA9500] if c not in {s["col"] for s in lob1["slots"]})
+        await c2.send_json({"type": "update_profile", "col": free_col})
+        lob1 = await c1.recv_json()
+        lob2 = await c2.recv_json()
+        assert lob1["slots"][2]["col"] == free_col and len({s["col"] for s in lob1["slots"]}) == 3
+
         await c1.send_json({"type": "start_match"})
         ms1 = await c1.recv_json()
         ms2 = await c2.recv_json()

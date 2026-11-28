@@ -1095,7 +1095,11 @@ export class NetworkClient {
           }
         }
         if ('col' in msg && PLAYER_COLORS.includes(Number(msg.col))) {
-          room.slots[slotIdx].col = Number(msg.col);
+          const wantCol = Number(msg.col);
+          const taken = room.slots.some((s, i) => i !== slotIdx && s.col === wantCol);
+          if (!taken) {
+            room.slots[slotIdx].col = wantCol;
+          }
         }
         this._p2pBroadcastLobby();
       }
@@ -1116,15 +1120,23 @@ export class NetworkClient {
         const save = msg.save;
         if (save && Array.isArray(save.playerData) && save.playerData.length >= 2 && save.playerData.length <= 5) {
           const connectedHumans = room.slots.filter((s) => s.kind === 'human');
-          const newSlots = save.playerData.map((pd) => ({
-            kind: 'ai',
-            clientId: null,
-            sessionId: null,
-            name: pd.name || 'Player',
-            col: pd.col ?? PLAYER_COLORS[0],
-            dif: pd.dif || 'normal',
-            wantHuman: pd.type === 'tank',
-          }));
+          const usedCols = new Set();
+          const newSlots = save.playerData.map((pd, i) => {
+            let col = PLAYER_COLORS.includes(pd.col) ? pd.col : PLAYER_COLORS[i % PLAYER_COLORS.length];
+            if (usedCols.has(col)) {
+              col = PLAYER_COLORS.find((c) => !usedCols.has(c)) ?? col;
+            }
+            usedCols.add(col);
+            return {
+              kind: 'ai',
+              clientId: null,
+              sessionId: null,
+              name: pd.name || 'Player',
+              col,
+              dif: pd.dif || 'normal',
+              wantHuman: pd.type === 'tank',
+            };
+          });
           // Place connected humans into saved human slots first, then any remaining slots
           const placedIndices = new Set();
           for (const h of connectedHumans) {
@@ -1187,7 +1199,8 @@ export class NetworkClient {
       } else if (action === 'set_slot_col') {
         const idx = Number(msg.index ?? -1);
         const col = Number(msg.col);
-        if (idx >= 0 && idx < room.slots.length && PLAYER_COLORS.includes(col)) {
+        const taken = room.slots.some((s, i) => i !== idx && s.col === col);
+        if (idx >= 0 && idx < room.slots.length && PLAYER_COLORS.includes(col) && !taken) {
           room.slots[idx].col = col;
         }
       }
@@ -1300,12 +1313,14 @@ export class NetworkClient {
     if (!room.inMatch) {
       room.slots = room.slots.filter((s) => s.clientId !== cid);
       while (room.slots.length < 2) {
+        const used = new Set(room.slots.map((s) => s.col));
+        const pickCol = PLAYER_COLORS.find((c) => !used.has(c)) ?? PLAYER_COLORS[room.slots.length % PLAYER_COLORS.length];
         room.slots.push({
           kind: 'ai',
           clientId: null,
           sessionId: null,
           name: `Bot ${room.slots.length + 1}`,
-          col: PLAYER_COLORS[room.slots.length % PLAYER_COLORS.length],
+          col: pickCol,
           dif: 'normal',
         });
       }

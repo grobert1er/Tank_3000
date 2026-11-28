@@ -179,16 +179,22 @@ export class TankGame {
     this.gameRound = 0;
     this.pendingStrikes = [];
     this.bannerToast = null;
-    this.playerData = capped.map((p, idx) =>
-      createInitialTankData(
+    const usedCols = new Set();
+    this.playerData = capped.map((p, idx) => {
+      let col = PLAYER_COLORS.includes(p.col) ? p.col : PLAYER_COLORS[idx % PLAYER_COLORS.length];
+      if (usedCols.has(col)) {
+        col = PLAYER_COLORS.find((c) => !usedCols.has(c)) ?? col;
+      }
+      usedCols.add(col);
+      return createInitialTankData(
         idx + 1,
         (p.name || '').trim() || `Player ${idx + 1}`,
-        p.col ?? PLAYER_COLORS[idx % PLAYER_COLORS.length],
+        col,
         p.type === 'ai' ? 'ai' : 'tank',
         p.dif || 'normal',
         this.balancePreset
-      )
-    );
+      );
+    });
     this.rng = new RNG();
     this.aiRng = new RNG(Date.now() ^ 0x5a5a5a5a);
     this._pendingStateSync = null;
@@ -291,16 +297,22 @@ export class TankGame {
     this.gameRound = 0;
     this.pendingStrikes = [];
     this.bannerToast = null;
-    this.playerData = players.map((p, idx) =>
-      createInitialTankData(
+    const usedCols = new Set();
+    this.playerData = players.map((p, idx) => {
+      let col = PLAYER_COLORS.includes(p.col) ? p.col : PLAYER_COLORS[idx % PLAYER_COLORS.length];
+      if (usedCols.has(col)) {
+        col = PLAYER_COLORS.find((c) => !usedCols.has(c)) ?? col;
+      }
+      usedCols.add(col);
+      return createInitialTankData(
         idx + 1,
         p.name || `Player ${idx + 1}`,
-        p.col ?? PLAYER_COLORS[idx % PLAYER_COLORS.length],
+        col,
         p.type || 'tank',
         p.dif || 'normal',
         this.balancePreset
-      )
-    );
+      );
+    });
     this.rng.setSeed(seed);
     this.aiRng.setSeed((seed ^ 0x5a5a5a5a) >>> 0);
     this._pendingStateSync = null;

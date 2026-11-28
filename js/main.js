@@ -375,12 +375,15 @@ async function boot() {
       const colors = document.createElement('div');
       colors.className = 'slot-colors';
       PLAYER_COLORS.forEach((colInt, ci) => {
+        const takenBy = setupPlayers.find((other, oIdx) => oIdx !== idx && other.col === colInt);
         const dot = document.createElement('button');
         dot.type = 'button';
-        dot.className = 'color-dot' + (p.col === colInt ? ' active' : '');
+        dot.className = 'color-dot' + (p.col === colInt ? ' active' : '') + (takenBy ? ' taken' : '');
         dot.style.background = COLOR_HEX[ci];
-        dot.title = 'Choose tank color';
+        dot.disabled = Boolean(takenBy);
+        dot.title = takenBy ? `Taken by ${takenBy.name || 'another player'}` : 'Choose tank color';
         dot.addEventListener('click', () => {
+          if (setupPlayers.some((other, oIdx) => oIdx !== idx && other.col === colInt)) return;
           p.col = colInt;
           sound.play(121, { volume: 0.5 });
           renderLocalSetupPlayers();
@@ -574,13 +577,18 @@ async function boot() {
       const swatches = document.createElement('div');
       swatches.className = 'slot-colors';
       PLAYER_COLORS.forEach((colInt, ci) => {
+        const takenBy = lobby.slots.find((other, oIdx) => oIdx !== idx && other.col === colInt);
         const sw = document.createElement('button');
         sw.type = 'button';
-        sw.className = 'color-dot' + (s.col === colInt ? ' active' : '');
+        sw.className = 'color-dot' + (s.col === colInt ? ' active' : '') + (takenBy ? ' taken' : '');
         sw.style.background = COLOR_HEX[ci];
         const canEditColor = s.isMe || (lobby.isHost && s.kind === 'ai');
-        sw.disabled = !canEditColor;
+        sw.disabled = !canEditColor || Boolean(takenBy);
+        sw.title = takenBy
+          ? `Taken by ${takenBy.name || 'another player'}`
+          : (canEditColor ? 'Choose tank color' : '');
         sw.addEventListener('click', () => {
+          if (takenBy) return;
           if (s.isMe) net.updateProfile({ col: colInt });
           else if (lobby.isHost && s.kind === 'ai') net.hostConfig('set_slot_col', { index: idx, col: colInt });
         });

@@ -299,7 +299,9 @@ class TankServer:
                         room.slots[slot_idx]["original_name"] = nm
                         client.name = nm
                 if "col" in msg and int(msg["col"]) in DEFAULT_COLORS:
-                    room.slots[slot_idx]["col"] = int(msg["col"])
+                    want_col = int(msg["col"])
+                    if all(i == slot_idx or s["col"] != want_col for i, s in enumerate(room.slots)):
+                        room.slots[slot_idx]["col"] = want_col
                 await self.broadcast_lobby(room)
             return
 
@@ -319,17 +321,21 @@ class TankServer:
                 save = msg.get("save")
                 if isinstance(save, dict) and isinstance(save.get("playerData"), list) and 2 <= len(save["playerData"]) <= 5:
                     connected_humans = [s for s in room.slots if s["kind"] == "human"]
-                    new_slots = [
-                        {
+                    used_cols: set[int] = set()
+                    new_slots = []
+                    for i, pd in enumerate(save["playerData"]):
+                        col = pd.get("col", DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
+                        if col not in DEFAULT_COLORS or col in used_cols:
+                            col = next((c for c in DEFAULT_COLORS if c not in used_cols), DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
+                        used_cols.add(col)
+                        new_slots.append({
                             "kind": "ai",
                             "client_id": None,
                             "name": pd.get("name") or "Player",
-                            "col": pd.get("col", DEFAULT_COLORS[0]),
+                            "col": col,
                             "dif": pd.get("dif", "normal"),
                             "want_human": pd.get("type") == "tank",
-                        }
-                        for pd in save["playerData"]
-                    ]
+                        })
                     placed_indices: set[int] = set()
                     for h in connected_humans:
                         t_idx = next((i for i, s in enumerate(new_slots) if i not in placed_indices and s["want_human"]), -1)
@@ -377,7 +383,11 @@ class TankServer:
             elif action == "set_slot_col":
                 idx = int(msg.get("index", -1))
                 col = int(msg.get("col", DEFAULT_COLORS[0]))
-                if 0 <= idx < len(room.slots) and col in DEFAULT_COLORS:
+                if (
+                    0 <= idx < len(room.slots)
+                    and col in DEFAULT_COLORS
+                    and all(i == idx or s["col"] != col for i, s in enumerate(room.slots))
+                ):
                     room.slots[idx]["col"] = col
             await self.broadcast_lobby(room)
             return
@@ -493,7 +503,9 @@ class TankServer:
             # Remove leaving human from lobby slots (keep >=2 slots by adding a bot if needed)
             room.slots = [s for s in room.slots if s["client_id"] != client.id]
             while len(room.slots) < 2:
-                room.slots.append({"kind": "ai", "client_id": None, "name": f"Bot {len(room.slots)+1}", "col": DEFAULT_COLORS[len(room.slots)%6], "dif": "normal"})
+                used_cols = {s["col"] for s in room.slots}
+                pick_col = next((c for c in DEFAULT_COLORS if c not in used_cols), DEFAULT_COLORS[len(room.slots) % 6])
+                room.slots.append({"kind": "ai", "client_id": None, "name": f"Bot {len(room.slots)+1}", "col": pick_col, "dif": "normal"})
             await self.broadcast_lobby(room)
         else:
             # Mid-match disconnect: convert disconnected slot to AI so match never stalls
