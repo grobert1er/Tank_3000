@@ -3,48 +3,306 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Tanks — Tank 3000</title>
-  <link rel="stylesheet" href="css/style.css?v=12">
+  <title>Tank 3000</title>
+  <link rel="stylesheet" href="css/style.css?v=13">
 </head>
 <body>
-  <div id="app">
-    <header id="top-bar">
-      <div class="bar-left">
-        <span class="brand">TANKS</span>
-        <span id="status-pill" class="pill">Loading...</span>
-        <button id="btn-resync" class="bar-btn" type="button" hidden title="Force resync match state with host">🔄 Resync</button>
-        <button id="btn-fast-forward" class="bar-btn warn" type="button" hidden title="Speed up remaining bot battle (4x)">⏩ Skip Bots (4×)</button>
-        <button id="btn-away-bot" class="bar-btn warn" type="button" hidden title="Replace away player with an AI bot"></button>
-      </div>
-      <div class="bar-right">
-        <div id="local-rules-bar" class="rules-inline" title="Local match rules & turn timer">
-          <select id="local-preset" class="bar-select" aria-label="Balance preset">
-            <option value="balanced" selected>Balanced</option>
-            <option value="classic">Classic / Chaos</option>
-          </select>
-          <select id="local-timer" class="bar-select" aria-label="Turn timer">
-            <option value="0" selected>Timer: Off</option>
-            <option value="20">Timer: 20s</option>
-            <option value="30">Timer: 30s</option>
-          </select>
-        </div>
-        <button id="btn-saves" class="bar-btn" type="button" title="Save or Resume a Mid-Game Match">💾 Saves</button>
-        <button id="btn-local" class="bar-btn" type="button" title="Return to Local Title Screen">Local Game</button>
-        <button id="btn-online" class="bar-btn accent" type="button" title="Play Online / LAN Multiplayer">Online Lobby</button>
-        <button id="btn-controls" class="bar-btn" type="button">Controls</button>
-        <button id="btn-mute" class="bar-btn" type="button">🔊 Sound</button>
-        <button id="btn-fullscreen" class="bar-btn" type="button" title="Toggle Fullscreen">⛶</button>
-      </div>
-    </header>
+  <div id="viewport-root">
+    <!-- Full-Viewport HiDPI Clean Paper-Cut Canvas -->
+    <canvas id="game-canvas"></canvas>
 
-    <main id="stage-wrap">
-      <canvas id="game-canvas" width="550" height="400"></canvas>
-    </main>
+    <!-- Floating Top-Right Utility Pills (Title / Local Setup / Shop) -->
+    <div id="menu-util-bar" class="util-pills">
+      <button id="btn-menu-home" class="glass-pill icon-pill" type="button" hidden title="Return to Title Screen">← Title</button>
+      <button id="btn-menu-resync" class="glass-pill icon-pill accent-soft" type="button" hidden title="Resync match state with host">🔄 Resync</button>
+      <button id="btn-menu-saves" class="glass-pill icon-pill" type="button" hidden title="Save or Resume a Mid-Game Match">💾 Saves</button>
+      <button id="btn-menu-mute" class="glass-pill icon-pill" type="button" title="Toggle Sound">🔊</button>
+      <button id="btn-menu-controls" class="glass-pill icon-pill" type="button" title="Keyboard & HUD Controls">?</button>
+      <button id="btn-menu-fullscreen" class="glass-pill icon-pill" type="button" title="Toggle Fullscreen (F)">⛶</button>
+    </div>
+
+    <!-- ==================== 1. TITLE SCREEN OVERLAY ==================== -->
+    <section id="screen-title" class="screen-layer">
+      <div class="glass-card title-card">
+        <div class="title-emblem" aria-hidden="true">
+          <svg viewBox="0 0 64 38" width="58" height="34">
+            <ellipse cx="32" cy="33" rx="22" ry="3.5" fill="rgba(15,23,42,0.14)"/>
+            <line x1="34" y1="15" x2="54" y2="6" stroke="#1e293b" stroke-width="4" stroke-linecap="round"/>
+            <rect x="13" y="21" width="38" height="10" rx="5" fill="#1e293b"/>
+            <circle cx="20" cy="26" r="2.2" fill="#64748b"/>
+            <circle cx="32" cy="26" r="2.2" fill="#64748b"/>
+            <circle cx="44" cy="26" r="2.2" fill="#64748b"/>
+            <path d="M12 22 L17 15 L47 15 L52 22 Z" fill="#0284c7"/>
+            <path d="M22 15 L26 9 L39 9 L43 15 Z" fill="#38bdf8"/>
+          </svg>
+        </div>
+        <h1 class="title-heading">TANK 3000</h1>
+        <p class="title-sub">Clean artillery strategy · Local &amp; Online multiplayer</p>
+        <div id="boot-status" class="boot-pill" hidden>Loading audio assets...</div>
+
+        <div class="title-actions">
+          <button id="btn-title-local" class="pc-btn primary lg" type="button">Play Local</button>
+          <button id="btn-title-online" class="pc-btn dark lg" type="button">Online / LAN Multiplayer</button>
+          <button id="btn-title-continue" class="pc-btn resume-btn" type="button" hidden>
+            <span class="resume-top">Continue Auto-Save</span>
+            <span id="title-continue-sub" class="resume-sub"></span>
+          </button>
+        </div>
+
+        <div class="title-footer-links">
+          <button id="btn-title-saves" class="pc-btn ghost sm" type="button">💾 Saved Matches</button>
+          <button id="btn-title-controls" class="pc-btn ghost sm" type="button">⌨ Controls</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 2. LOCAL MATCH SETUP OVERLAY ==================== -->
+    <section id="screen-local-setup" class="screen-layer" hidden>
+      <div class="glass-card setup-card">
+        <div class="card-head">
+          <div>
+            <h2>Local Match Setup</h2>
+            <p class="card-sub">Configure battlefield, rules, and 2–5 human or AI commanders</p>
+          </div>
+          <button id="btn-setup-back" class="pc-btn ghost sm" type="button">← Back</button>
+        </div>
+
+        <div class="setup-settings-grid">
+          <label class="setting-chip">
+            <span>Terrain</span>
+            <select id="setup-terrain">
+              <option value="0" selected>Random</option>
+              <option value="1">Snow Mountains</option>
+              <option value="2">Forest Hills</option>
+              <option value="3">Desert Dunes</option>
+            </select>
+          </label>
+          <label class="setting-chip">
+            <span>Rules</span>
+            <select id="setup-preset">
+              <option value="balanced" selected>Balanced</option>
+              <option value="classic">Classic / Chaos</option>
+            </select>
+          </label>
+          <label class="setting-chip">
+            <span>Turn Timer</span>
+            <select id="setup-timer">
+              <option value="0" selected>Off</option>
+              <option value="20">20 seconds</option>
+              <option value="30">30 seconds</option>
+            </select>
+          </label>
+        </div>
+
+        <div id="setup-players-list" class="setup-players-list"></div>
+
+        <div class="setup-footer">
+          <button id="btn-setup-add-player" class="pc-btn ghost" type="button">+ Add Player / Bot</button>
+          <button id="btn-setup-start" class="pc-btn fire lg" type="button">Start Battle →</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 3. BATTLE HUD OVERLAY ==================== -->
+    <section id="hud-battle" class="hud-layer" hidden>
+      <!-- Top Floating Pills Bar -->
+      <div class="hud-top">
+        <!-- Top-Left: Active Player + Compact Utility Controls -->
+        <div class="hud-top-left">
+          <div class="glass-pill active-player-pill">
+            <span id="hud-player-dot" class="player-dot"></span>
+            <span id="hud-player-name" class="player-name">Player 1</span>
+            <span class="pill-sep"></span>
+            <span class="hp-chip" title="Tank Hull Energy">
+              <span class="hp-chip-bar"><span id="hud-hp-fill" class="hp-chip-fill"></span></span>
+              <span id="hud-hp-text" class="tabular">100</span>
+            </span>
+            <span id="hud-shield-chip" class="shield-chip" hidden title="Active Shield">🛡 <span id="hud-shield-val">100</span></span>
+            <span class="pill-sep"></span>
+            <span id="hud-cash" class="cash-text tabular">$4,000</span>
+          </div>
+
+          <div class="hud-mini-bar">
+            <button id="btn-hud-menu" class="glass-pill mini-pill" type="button" title="Return to Title Screen">Menu</button>
+            <button id="btn-hud-saves" class="glass-pill mini-pill" type="button" title="Save or Load Match">💾 Saves</button>
+            <button id="btn-hud-online" class="glass-pill mini-pill" type="button" title="Online / LAN Lobby">Online</button>
+            <button id="btn-hud-controls" class="glass-pill mini-pill" type="button" title="Controls">?</button>
+            <button id="btn-hud-mute" class="glass-pill mini-pill" type="button" title="Toggle Sound">🔊</button>
+            <button id="btn-resync" class="glass-pill mini-pill accent-soft" type="button" hidden title="Force resync match state with host">🔄 Resync</button>
+            <button id="btn-fast-forward" class="glass-pill mini-pill warn-soft" type="button" hidden title="Speed up remaining bot battle (4x)">⏩ Skip Bots (4×)</button>
+            <button id="btn-away-bot" class="glass-pill mini-pill warn-soft" type="button" hidden title="Replace away player with an AI bot"></button>
+          </div>
+        </div>
+
+        <!-- Top-Center: Round, Wind, Timer, Sudden Death & Event Banner -->
+        <div class="hud-top-center">
+          <div class="glass-pill wind-pill">
+            <span id="hud-round" class="round-tag">R1</span>
+            <span class="pill-sep"></span>
+            <span class="wind-wrap" title="Wind strength & direction">
+              <span id="hud-wind-arrow" class="wind-arrow">→</span>
+              <span class="wind-bar-track"><span id="hud-wind-bar" class="wind-bar-fill"></span></span>
+              <span id="hud-wind-val" class="wind-val tabular">0</span>
+            </span>
+            <span id="hud-timer-badge" class="timer-badge tabular" hidden>⏱ 20s</span>
+            <span id="hud-sd-badge" class="sd-badge" hidden>1.5× DMG</span>
+            <span id="hud-ff-badge" class="ff-badge" hidden>4×</span>
+          </div>
+          <div id="hud-banner" class="hud-banner" hidden></div>
+        </div>
+
+        <!-- Top-Right: Compact Live Scoreboard + Fullscreen Button -->
+        <div class="hud-top-right">
+          <div id="hud-scoreboard" class="glass-card scoreboard-card"></div>
+          <button id="btn-fullscreen" class="glass-pill icon-pill fs-btn" type="button" title="Toggle Fullscreen (F)">⛶</button>
+        </div>
+      </div>
+
+      <!-- Bottom-Center Floating Command Dock -->
+      <div class="hud-bottom">
+        <!-- Expandable Weapon Drawer Popover -->
+        <div id="weapon-drawer" class="glass-card popover-panel weapon-drawer" hidden>
+          <div class="popover-head">
+            <span>Select Weapon</span>
+            <span class="popover-hint">Q / E to cycle</span>
+          </div>
+          <div id="weapon-drawer-grid" class="weapon-grid"></div>
+        </div>
+
+        <!-- Expandable Shield Selector Popover -->
+        <div id="shield-popover" class="glass-card popover-panel shield-popover" hidden>
+          <div class="popover-head">
+            <span>Deploy Shield</span>
+            <span id="shield-popover-note" class="popover-hint">1 per round</span>
+          </div>
+          <div id="shield-popover-list" class="shield-list"></div>
+        </div>
+
+        <!-- Floating Command Dock Bar -->
+        <div id="command-dock" class="glass-card command-dock">
+          <!-- Drive / Fuel -->
+          <div class="dock-group fuel-group" title="Move tank left/right (← / →)">
+            <button id="btn-drive-left" class="dock-step-btn" type="button" aria-label="Drive left">◀</button>
+            <div class="fuel-readout">
+              <span class="dock-label">FUEL</span>
+              <span id="dock-fuel-val" class="dock-val tabular">100</span>
+            </div>
+            <button id="btn-drive-right" class="dock-step-btn" type="button" aria-label="Drive right">▶</button>
+          </div>
+
+          <div class="dock-divider"></div>
+
+          <!-- Angle Slider -->
+          <div class="dock-group slider-group" title="Cannon Angle (↑ / ↓)">
+            <div class="slider-top">
+              <span class="dock-label">ANGLE</span>
+              <span id="dock-angle-val" class="dock-val tabular">90°</span>
+            </div>
+            <input id="dock-angle-slider" class="pc-slider angle-slider" type="range" min="0" max="180" step="1" value="90" aria-label="Cannon angle">
+          </div>
+
+          <!-- Power Slider -->
+          <div class="dock-group slider-group" title="Fire Power (W / S or PgUp / PgDn)">
+            <div class="slider-top">
+              <span class="dock-label">POWER</span>
+              <span class="dock-val tabular"><span id="dock-power-val">50</span><span id="dock-maxpow-cap" class="maxpow-cap"></span></span>
+            </div>
+            <div class="power-slider-wrap">
+              <input id="dock-power-slider" class="pc-slider power-slider" type="range" min="0" max="100" step="1" value="50" aria-label="Fire power">
+              <span id="dock-power-lock" class="power-lock-zone" hidden></span>
+            </div>
+          </div>
+
+          <div class="dock-divider"></div>
+
+          <!-- Weapon Selector + Drawer Trigger -->
+          <div class="dock-group weapon-group">
+            <button id="btn-weapon-prev" class="dock-step-btn" type="button" title="Previous Weapon (Q)">◀</button>
+            <button id="btn-weapon-drawer" class="weapon-pill-btn" type="button" title="Open Weapon Drawer">
+              <span id="dock-weapon-icon" class="weapon-svg-slot"></span>
+              <span id="dock-weapon-name" class="weapon-name">Small missile</span>
+              <span id="dock-weapon-ammo" class="ammo-badge tabular">∞</span>
+              <span class="drawer-caret">▴</span>
+            </button>
+            <button id="btn-weapon-next" class="dock-step-btn" type="button" title="Next Weapon (E)">▶</button>
+          </div>
+
+          <div class="dock-divider"></div>
+
+          <!-- Specials Quick Buttons (crisp geometric SVGs matching Armory Shop) -->
+          <div class="dock-group specials-group">
+            <button id="btn-sp-repair" class="sp-btn" type="button" title="Repair Kit (+15 HP)">
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><rect x="8" y="3" width="4" height="14" rx="1.5" fill="#16a34a"/><rect x="3" y="8" width="14" height="4" rx="1.5" fill="#16a34a"/></svg>
+              <span id="sp-repair-cnt" class="sp-cnt tabular">2</span>
+            </button>
+            <button id="btn-sp-para" class="sp-btn" type="button" title="Toggle Parachute">
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M3 10 A7 7 0 0 1 17 10 Z" fill="#f97316"/><path d="M5 10 L10 16 L15 10" fill="none" stroke="#334155" stroke-width="1.5"/></svg>
+              <span id="sp-para-cnt" class="sp-cnt tabular">2</span>
+            </button>
+            <button id="btn-sp-shield" class="sp-btn" type="button" title="Deploy Shield (1 per round)">
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M10 2.5 L16.5 5.2 L16.5 10.5 C16.5 14.3 13.6 16.8 10 18 C6.4 16.8 3.5 14.3 3.5 10.5 L3.5 5.2 Z" fill="#0284c7" fill-opacity="0.22" stroke="#0284c7" stroke-width="1.8"/></svg>
+              <span id="sp-shield-cnt" class="sp-cnt tabular">1</span>
+            </button>
+            <button id="btn-sp-tele" class="sp-btn" type="button" title="Teleport Tank">
+              <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><circle cx="10" cy="10" r="5.8" fill="none" stroke="#0284c7" stroke-width="1.7"/><circle cx="10" cy="10" r="2.2" fill="#38bdf8"/><path d="M10 1.5 V4.5 M10 15.5 V18.5 M1.5 10 H4.5 M15.5 10 H18.5" stroke="#0284c7" stroke-width="1.5"/></svg>
+              <span id="sp-tele-cnt" class="sp-cnt tabular">0</span>
+            </button>
+          </div>
+
+          <!-- Primary FIRE CTA -->
+          <button id="btn-fire" class="pc-btn fire fire-cta" type="button" title="Fire Weapon (Space)">
+            <span>FIRE</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 4. BETWEEN-ROUND ARMORY SHOP OVERLAY ==================== -->
+    <section id="screen-shop" class="screen-layer" hidden>
+      <div class="glass-card shop-card">
+        <div class="shop-header">
+          <div class="shop-player-meta">
+            <span id="shop-player-dot" class="player-dot lg"></span>
+            <div>
+              <div class="shop-title-row">
+                <h2 id="shop-player-name">Player 1</h2>
+                <span id="shop-round-badge" class="round-chip">Round 1 Complete</span>
+              </div>
+              <p class="card-sub">Stock up on ordnance, shields, and permanent chassis upgrades</p>
+            </div>
+          </div>
+          <div class="shop-cash-box">
+            <span class="shop-cash-label">AVAILABLE CASH</span>
+            <span id="shop-cash-val" class="shop-cash-val tabular">$4,000</span>
+          </div>
+        </div>
+
+        <div id="shop-toast" class="shop-toast" hidden></div>
+
+        <div class="shop-columns">
+          <div class="shop-col">
+            <div class="shop-col-title">Weapons</div>
+            <div id="shop-weapons-list" class="shop-items-list"></div>
+          </div>
+          <div class="shop-col">
+            <div class="shop-col-title">Defenses &amp; Permanent Upgrades</div>
+            <div id="shop-specials-list" class="shop-items-list"></div>
+          </div>
+        </div>
+
+        <div class="shop-footer">
+          <div id="shop-scoreboard" class="shop-score-strip"></div>
+          <button id="btn-shop-next" class="pc-btn primary lg" type="button">Next Player →</button>
+        </div>
+      </div>
+    </section>
   </div>
+
+  <!-- ==================== MODALS (UNIFIED PAPER-CUT GLASS) ==================== -->
 
   <!-- Online / LAN Multiplayer Lobby Modal -->
   <div id="lobby-modal" class="modal-backdrop" hidden>
-    <div class="modal-card">
+    <div class="glass-card modal-card">
       <div class="modal-head">
         <h2>Online / LAN Multiplayer</h2>
         <button type="button" class="close-btn" data-close-modal>&times;</button>
@@ -64,10 +322,10 @@
           </select>
         </div>
         <div class="entry-actions">
-          <button id="btn-create-room" type="button" class="primary-btn">Create Room</button>
+          <button id="btn-create-room" type="button" class="pc-btn primary">Create Room</button>
           <div class="join-group">
             <input id="lobby-code" type="text" maxlength="6" placeholder="CODE" style="text-transform:uppercase">
-            <button id="btn-join-room" type="button" class="secondary-btn">Join Room</button>
+            <button id="btn-join-room" type="button" class="pc-btn ghost">Join Room</button>
           </div>
         </div>
         <p id="lobby-hint" class="hint">
@@ -82,8 +340,8 @@
             <span id="room-code-display" class="room-code">----</span>
           </div>
           <div class="room-header-actions">
-            <button id="btn-lobby-load-save" type="button" class="secondary-btn small" title="Resume a saved match with this room">💾 Load Save</button>
-            <button id="btn-copy-invite" type="button" class="secondary-btn small">Copy Invite Link</button>
+            <button id="btn-lobby-load-save" type="button" class="pc-btn ghost sm" title="Resume a saved match with this room">💾 Load Save</button>
+            <button id="btn-copy-invite" type="button" class="pc-btn ghost sm">Copy Invite Link</button>
           </div>
         </div>
 
@@ -99,11 +357,11 @@
           <label for="room-terrain">Terrain:</label>
           <select id="room-terrain">
             <option value="0">Random</option>
-            <option value="1">Mountains (Snow)</option>
-            <option value="2">Forest (Grass)</option>
-            <option value="3">Desert (Sand)</option>
+            <option value="1">Snow Mountains</option>
+            <option value="2">Forest Hills</option>
+            <option value="3">Desert Dunes</option>
           </select>
-          <button id="btn-add-bot" type="button" class="secondary-btn small">+ Add Bot</button>
+          <button id="btn-add-bot" type="button" class="pc-btn ghost sm">+ Add Bot</button>
         </div>
 
         <div class="room-settings">
@@ -123,8 +381,8 @@
         <div id="room-slots" class="slots-list"></div>
 
         <div class="room-footer">
-          <button id="btn-leave-room" type="button" class="secondary-btn">Leave Room</button>
-          <button id="btn-start-online" type="button" class="primary-btn">Start Match</button>
+          <button id="btn-leave-room" type="button" class="pc-btn ghost">Leave Room</button>
+          <button id="btn-start-online" type="button" class="pc-btn fire">Start Match</button>
         </div>
       </div>
     </div>
@@ -132,7 +390,7 @@
 
   <!-- Mid-Game Save / Load Modal -->
   <div id="saves-modal" class="modal-backdrop" hidden>
-    <div class="modal-card">
+    <div class="glass-card modal-card">
       <div class="modal-head">
         <h2>Mid-Game Saves</h2>
         <button type="button" class="close-btn" data-close-modal>&times;</button>
@@ -142,7 +400,7 @@
       <div id="save-now-section" class="save-now-box">
         <div class="save-now-row">
           <input id="save-name-input" type="text" maxlength="40" placeholder="Optional save name (e.g. Round 5 comeback)">
-          <button id="btn-save-now" type="button" class="primary-btn">Save Now</button>
+          <button id="btn-save-now" type="button" class="pc-btn primary">Save Now</button>
         </div>
         <p id="save-now-hint" class="hint">Auto-save runs automatically every turn and at the Shop. You can also save snapshots manually or export a .json file.</p>
       </div>
@@ -151,31 +409,32 @@
 
       <div class="saves-footer">
         <input id="import-save-file" type="file" accept=".json,application/json" hidden>
-        <button id="btn-import-save" type="button" class="secondary-btn small">Import .json File</button>
-        <button type="button" class="secondary-btn small" data-close-modal>Close</button>
+        <button id="btn-import-save" type="button" class="pc-btn ghost sm">Import .json File</button>
+        <button type="button" class="pc-btn ghost sm" data-close-modal>Close</button>
       </div>
     </div>
   </div>
 
   <!-- Controls Modal -->
   <div id="controls-modal" class="modal-backdrop" hidden>
-    <div class="modal-card compact">
+    <div class="glass-card modal-card compact">
       <div class="modal-head">
         <h2>Controls</h2>
         <button type="button" class="close-btn" data-close-modal>&times;</button>
       </div>
       <table class="controls-table">
-        <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>Move tank (uses fuel) / Flip Air Strike direction</td></tr>
-        <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>Rotate cannon angle (or drag HUD slider)</td></tr>
-        <tr><td><kbd>PgUp</kbd> / <kbd>PgDn</kbd> or <kbd>W</kbd> / <kbd>S</kbd></td><td>Adjust fire power (or drag HUD bar)</td></tr>
-        <tr><td><kbd>Q</kbd> / <kbd>E</kbd></td><td>Cycle weapons (or click HUD arrows)</td></tr>
-        <tr><td><kbd>Space</kbd></td><td>Fire weapon (or click HUD Fire button)</td></tr>
-        <tr><td>Mouse HUD</td><td>Repair (+15 HP), Parachutes, Teleport, Shields (1/round), Shop</td></tr>
+        <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>Drive tank (uses fuel) · Flip Air Strike direction</td></tr>
+        <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>Adjust cannon angle (or drag Angle slider)</td></tr>
+        <tr><td><kbd>W</kbd> / <kbd>S</kbd> or <kbd>PgUp</kbd> / <kbd>PgDn</kbd></td><td>Adjust fire power (or drag Power slider)</td></tr>
+        <tr><td><kbd>Q</kbd> / <kbd>E</kbd></td><td>Cycle weapons (or open Weapon Drawer)</td></tr>
+        <tr><td><kbd>Space</kbd></td><td>Fire selected weapon</td></tr>
+        <tr><td><kbd>F</kbd></td><td>Toggle fullscreen mode</td></tr>
+        <tr><td>Bottom Dock</td><td>Repair (+15 HP), Parachute, Shields (1/round), Teleport</td></tr>
       </table>
     </div>
   </div>
 
-  <script src="js/vendor/peerjs.min.js?v=12"></script>
-  <script type="module" src="js/main.js?v=12"></script>
+  <script src="js/vendor/peerjs.min.js?v=13"></script>
+  <script type="module" src="js/main.js?v=13"></script>
 </body>
 </html>

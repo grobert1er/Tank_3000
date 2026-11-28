@@ -1,8 +1,8 @@
-// Master 25Hz Game Controller, Scene State Machine, Menus, HUD Panel & Shop
+// Master 25Hz Game Controller, Scene State Machine, Battle Simulation, Economy & Shop
 
 import {
-  STAGE_W, STAGE_H, FPS, PANEL_X, PANEL_Y,
-  PLAYER_COLORS, AI_DIFFICULTIES, WEAPONS, SPECIALS, SHIELD_TIERS, SOUNDS,
+  STAGE_W, STAGE_H, FPS,
+  PLAYER_COLORS, WEAPONS, SPECIALS, SOUNDS,
   MAX_UPGRADE_LEVEL, REPAIR_HEAL_AMOUNT, ROUND_BASE_STIPEND, ROUND_WIN_BONUS,
   SUDDEN_DEATH_TURN, getMaxPower, createInitialTankData,
 } from './constants.js';
@@ -11,7 +11,11 @@ import { Terrain } from './terrain.js';
 import { Tank } from './tank.js';
 import { Projectile, AirStrikeController, TeleportController, spawnAirStrikeBombs, getWeaponSpec } from './weapons.js';
 import { tickAI, aiBuyInShop } from './ai.js';
-import { rgbToCx, alphaCx } from './renderer.js';
+import { VfxManager } from './vfx.js';
+
+function hexIntToCss(col) {
+  return '#' + ((col ?? 0x333333) >>> 0).toString(16).padStart(6, '0');
+}
 
 export class TankGame {
   constructor(renderer, sound, callbacks = {}) {
@@ -22,13 +26,14 @@ export class TankGame {
     this.rng = new RNG();
     this.aiRng = new RNG(Date.now() ^ 0x5a5a5a5a);
     this.terrain = new Terrain();
+    this.vfx = new VfxManager();
 
     // Game mode: 'local' | 'online'
     this.mode = 'local';
     this.mySlot = 0; // 1..5 in online mode
     this.isHost = true;
     this.onlineReadySent = false;
-    this.onlineReadyStatus = ''; // e.g. 'Waiting (1/2)'
+    this.onlineReadyStatus = '';
     this._pendingStateSync = null;
     this._pendingStateSyncWait = 0;
 
@@ -42,24 +47,14 @@ export class TankGame {
     this._roundPayoutAwarded = false;
     this.fastForward = false; // 4x simulation speed when only AI bots remain alive
 
-    // Scene state: 'menu1' | 'menu2' | 'loading' | 'battle' | 'round_end' | 'shop'
+    // Scene state: 'menu1' | 'menu2' | 'loading' | 'battle' | 'shop'
     this.scene = 'menu1';
-    this.quality = 'HIGH'; // 'HIGH' | 'MEDIUM' | 'LOW'
+    this.quality = 'HIGH';
 
-    // Title / setup menu state
+    // Match setup state
     this.krajinaSetting = 0; // 0=Random, 1=Mountains, 2=Forest, 3=Desert
     this.randKrajina = true;
     this.playerCount = 2; // 2..5
-    this.menu1Released = false;
-
-    // Local player configuration state
-    this.setupCur = 1;
-    this.setupName = '';
-    this.setupColorIdx = 3; // default 0x333333 (m4)
-    this.setupType = 'tank'; // 'tank' | 'ai'
-    this.setupDif = 'normal'; // m3
-    this.setupAiAlpha = 0; // 0..1 fade for AI difficulty panel (Sprite 394)
-    this.nameInputFocused = true;
 
     // Persistent players array (1-indexed via index = t_num - 1)
     this.playerData = [];
@@ -76,34 +71,27 @@ export class TankGame {
     this.shotFlying = false;
     this.roundEndPending = false;
     this.roundTransitioning = false;
-    this.roundEndTimer = 0; // Sprite 402 36-frame delay
+    this.roundEndTimer = 0;
     this.projectiles = [];
     this.airStrike = null;
     this.teleport = null;
     this._aiPendingAirStrike = null;
     this._aiPendingTeleport = null;
-    this.blik = null; // { x, y, frame } Sprite 225 (35 frames)
+    this.blik = null; // { x, y, frame, col }
 
-    // Panel HUD interactive state
+    // HUD interactive hold state
     this.shieldsMenuOpen = false;
-    this.hoverShieldTier = 0;
-    this.hoverHudButton = 0; // Active HUD button ID for hover tooltips & over states
-    this.draggingPower = false;
     this.draggingAngle = false;
     this.holdingFuelLeft = false;
     this.holdingFuelRight = false;
 
-    // Blast-door curtain transition (`clona`, Sprite 247)
-    this.clona = null;
+    // Shop state
+    this.shopCur = 0; // 1..N player currently shopping
 
-    // Shop state (inside `clona`)
-    this.shopCur = 0; // 1..N player currently shopping (local mode: sequential; online mode: mySlot)
-
-    // Mouse / hover tracking in stage coords (0..550, 0..400)
+    // Pointer tracking in stage coords (0..550, 0..400) for Air Strike & Teleport
     this.mouseX = 275;
     this.mouseY = 200;
     this.mouseDown = false;
-    this.hoverId = null;
     this.cursorHidden = false;
 
     // Keyboard live state
@@ -120,20 +108,34 @@ export class TankGame {
     // Network live-aim throttling
     this._aimSyncCounter = 0;
     this._lastSentAim = '';
+
+    // Boot straight into a scenic Paper-Cut panorama behind the Title overlay
+    this._initTitlePanorama(1);
   }
 
-  // ==================== SCENE INITIALIZERS ====================
+  // ==================== SCENIC BACKDROP & SCENE INITIALIZERS ====================
+
+  _initTitlePanorama(biome = 1) {
+    const k = biome >= 1 && biome <= 3 ? biome : 1;
+    const previewRng = new RNG(20261128 + k * 7919);
+    this.terrain.beginGenerate(k, previewRng, true);
+    this.terrain.vitr = k === 1 ? 14 : k === 2 ? 10 : 18;
+    this.vfx.clearBattleFx();
+  }
+
+  setTitlePreviewBiome(krajinaSetting) {
+    this.krajinaSetting = Number(krajinaSetting) || 0;
+    this.randKrajina = this.krajinaSetting === 0;
+    if (this.scene === 'menu1' || this.scene === 'menu2') {
+      this._initTitlePanorama(this.krajinaSetting === 0 ? 1 : this.krajinaSetting);
+    }
+  }
 
   resetToTitle() {
     this.mode = 'local';
     this.mySlot = 0;
     this.isHost = true;
     this.scene = 'menu1';
-    this.krajinaSetting = 0;
-    this.randKrajina = true;
-    this.playerCount = 2;
-    this.menu1Released = false;
-    this.clona = null;
     this.tanks = [];
     this.projectiles = [];
     this.airStrike = null;
@@ -146,7 +148,51 @@ export class TankGame {
     this.blik = null;
     this.shieldsMenuOpen = false;
     this.cursorHidden = false;
+    this.clearKeys();
+    this._initTitlePanorama(this.krajinaSetting === 0 ? 1 : this.krajinaSetting);
     this._notifyStatus();
+  }
+
+  openLocalSetup() {
+    this.mode = 'local';
+    this.mySlot = 0;
+    this.isHost = true;
+    this.scene = 'menu2';
+    this.setTitlePreviewBiome(this.krajinaSetting);
+    this._notifyStatus();
+  }
+
+  // Instant HTML-card local match launcher
+  startLocalMatch({ krajina = 0, preset = 'balanced', turnTimer = 0, players = [] } = {}) {
+    if (!Array.isArray(players) || players.length < 2) return;
+    this.mode = 'local';
+    this.mySlot = 0;
+    this.isHost = true;
+    this.krajinaSetting = Number(krajina) || 0;
+    this.randKrajina = this.krajinaSetting === 0;
+    this.setBalancePreset(preset);
+    this.setTurnTimer(turnTimer);
+
+    const capped = players.slice(0, 5);
+    this.playerCount = capped.length;
+    this.gameRound = 0;
+    this.pendingStrikes = [];
+    this.bannerToast = null;
+    this.playerData = capped.map((p, idx) =>
+      createInitialTankData(
+        idx + 1,
+        (p.name || '').trim() || `Player ${idx + 1}`,
+        p.col ?? PLAYER_COLORS[idx % PLAYER_COLORS.length],
+        p.type === 'ai' ? 'ai' : 'tank',
+        p.dif || 'normal',
+        this.balancePreset
+      )
+    );
+    this.rng = new RNG();
+    this.aiRng = new RNG(Date.now() ^ 0x5a5a5a5a);
+    this._pendingStateSync = null;
+    this._pendingStateSyncWait = 0;
+    this._startNextRound();
   }
 
   // True during battle when >= 2 tanks are alive and ALL surviving tanks are AI bots
@@ -189,7 +235,7 @@ export class TankGame {
     this.turnTimerSec = [0, 20, 30].includes(s) ? s : 0;
   }
 
-  showToast(text, color = '#ffe680', frames = 65) {
+  showToast(text, color = '#0284c7', frames = 65) {
     this.bannerToast = { text, color, frames };
   }
 
@@ -219,27 +265,6 @@ export class TankGame {
     return topScore > 0 && topCount === 1 && topNum === tankNumber;
   }
 
-  _initMenu2() {
-    this.scene = 'menu2';
-    this.randKrajina = this.krajinaSetting === 0;
-    this.playerData = [];
-    for (let i = 1; i <= this.playerCount; i++) {
-      this.playerData.push(
-        createInitialTankData(i, '', PLAYER_COLORS[3], 'tank', 'normal', this.balancePreset)
-      );
-    }
-    this.gameRound = 0;
-    this.setupCur = 1;
-    this.setupName = '';
-    this.setupColorIdx = 3;
-    this.setupType = 'tank';
-    this.setupDif = 'normal';
-    this.setupAiAlpha = 0;
-    this.menu1Released = false;
-    this.nameInputFocused = true;
-    this._notifyStatus();
-  }
-
   // Start an online multiplayer match from lobby config (or resume a saved match!)
   startOnlineMatch({ seed, krajina, players, mySlot, isHost, preset, turnTimer, savedState }) {
     this.mode = 'online';
@@ -263,7 +288,6 @@ export class TankGame {
     this.randKrajina = krajina === 0;
     this.playerCount = players.length;
     this.gameRound = 0;
-    this.clona = null;
     this.pendingStrikes = [];
     this.bannerToast = null;
     this.playerData = players.map((p, idx) =>
@@ -291,19 +315,7 @@ export class TankGame {
     this._pendingStateSyncWait = 0;
     this.rng.setSeed(seed);
     this.aiRng.setSeed((seed ^ 0x5a5a5a5a) >>> 0);
-    if (this.clona && this.scene === 'shop') {
-      this.clona.purchasing = false;
-      this.clona.projizdi = true;
-      this.clona.openingAfterShop = true;
-      this.clona.speed = -4;
-      this.sound.play(SOUNDS.CLONA_DOOR, { volume: 0.75, noMultiple: true });
-      this._prepareRoundData();
-      this.scene = 'loading';
-      this.terrain.beginGenerate(this.krajinaSetting, this.rng, false);
-    } else {
-      this._startNextRound();
-    }
-    this._notifyStatus();
+    this._startNextRound();
   }
 
   _prepareRoundData() {
@@ -322,7 +334,7 @@ export class TankGame {
 
   _startNextRound() {
     this._prepareRoundData();
-    this.scene = 'loading';
+    this.vfx.clearBattleFx();
     this.tanks = [];
     this.projectiles = [];
     this.airStrike = null;
@@ -332,8 +344,8 @@ export class TankGame {
     this.blik = null;
     this.shieldsMenuOpen = false;
     this.cursorHidden = false;
-    this.terrain.beginGenerate(this.krajinaSetting, this.rng, false);
-    this._notifyStatus();
+    this.terrain.beginGenerate(this.krajinaSetting, this.rng, true);
+    this._enterBattle();
   }
 
   // Tank spawning & turn order setup
@@ -348,7 +360,6 @@ export class TankGame {
     this._aiPendingTeleport = null;
     this.blik = null;
     this.shieldsMenuOpen = false;
-    this.draggingPower = false;
     this.draggingAngle = false;
     this.holdingFuelLeft = false;
     this.holdingFuelRight = false;
@@ -390,7 +401,7 @@ export class TankGame {
     }
 
     // Sort round turn order strictly from lowest total_score to highest total_score,
-    // breaking equal-score ties (like Round 1 at 0-0) via deterministic seeded roll
+    // breaking equal-score ties via deterministic seeded roll
     const tieRolls = new Map();
     for (const tk of this.tanks) {
       tieRolls.set(tk.tankNumber, this.rng.random(100000));
@@ -417,7 +428,6 @@ export class TankGame {
     this._roundPayoutAwarded = true;
 
     const survivor = this.tanks.find((t) => t.data.live && t.data.energy > 0) || null;
-    // Rank players by total_score descending to determine underdog catch-up bonus
     const ranked = [...this.playerData].sort(
       (a, b) => b.total_score - a.total_score || a.t_num - b.t_num
     );
@@ -425,9 +435,7 @@ export class TankGame {
 
     for (let i = 0; i < ranked.length; i++) {
       const pd = ranked[i];
-      // Base round stipend so nobody is ever stuck broke
       pd.score += ROUND_BASE_STIPEND;
-      // Underdog catch-up cash (shop budget only, doesn't inflate leaderboard score)
       if (i > 0 && pd.total_score < leaderScore) {
         pd.score += i * 1000;
       }
@@ -437,12 +445,12 @@ export class TankGame {
       survivor.data.score += ROUND_WIN_BONUS;
       survivor.data.total_score += ROUND_WIN_BONUS;
       this.showToast(
-        `${survivor.data.name} WINS! +$${ROUND_WIN_BONUS} · Round stipend +$${ROUND_BASE_STIPEND}`,
-        '#7ef29d',
+        `${survivor.data.name} WINS! +$${ROUND_WIN_BONUS.toLocaleString()} · Stipend +$${ROUND_BASE_STIPEND.toLocaleString()}`,
+        '#16a34a',
         75
       );
     } else {
-      this.showToast(`DRAW ROUND! Stipend +$${ROUND_BASE_STIPEND}`, '#ffe680', 70);
+      this.showToast(`DRAW ROUND! Stipend +$${ROUND_BASE_STIPEND.toLocaleString()}`, '#d97706', 70);
     }
   }
 
@@ -474,11 +482,10 @@ export class TankGame {
       }
       spawnAirStrikeBombs(this, strike);
     }
-    this.showToast('AIR STRIKE IMPACT!', '#ff6b6b', 45);
+    this.showToast('AIR STRIKE IMPACT!', '#dc2626', 45);
     return true;
   }
 
-  // Trigger tank settling check
   triggerTest() {
     for (const tank of this.tanks) {
       tank.playing = false;
@@ -507,18 +514,24 @@ export class TankGame {
     this.roundTurns += 1;
     const newMult = this.getDamageMultiplier();
     if (newMult > prevMult) {
-      this.showToast(`SUDDEN DEATH! ${newMult.toFixed(1)}× DAMAGE`, '#ff7b54', 70);
+      this.showToast(`SUDDEN DEATH! ${newMult.toFixed(1)}× DAMAGE`, '#ea580c', 70);
     }
 
     this.turnTicksLeft = this.turnTimerSec > 0 ? this.turnTimerSec * FPS : 0;
 
     if (this.aliveCount > 1 && this.activeTank && this.activeTank.data.live) {
-      this.blik = { x: this.activeTank.x, y: this.activeTank.y - 10, frame: 0 };
+      this.blik = {
+        x: this.activeTank.x,
+        y: this.activeTank.y,
+        frame: 0,
+        col: hexIntToCss(this.activeTank.data.col),
+      };
     }
     this.terrain.updateWind(this.rng);
     this.sound.stop(SOUNDS.TURRET_MOVE);
     this.activeTank.onTurnStart();
     this.shieldsMenuOpen = false;
+    this.shotFlying = false;
     this._notifyStatus();
 
     // Auto-save cleanly at the start of every turn (Local or Online Host)
@@ -535,7 +548,6 @@ export class TankGame {
     }
   }
 
-  // Can the local user control the active tank right now?
   canLocalControl() {
     if (this.scene !== 'battle' || !this.activeTank || !this.activeTank.playing) return false;
     if (this.activeTank.type !== 'tank') return false;
@@ -552,6 +564,30 @@ export class TankGame {
       return this.activeTank.tankNumber === this.mySlot;
     }
     return this.activeTank.type === 'tank';
+  }
+
+  // ==================== HTML HUD CONTROL BRIDGE ====================
+
+  setAngle(deg) {
+    if (!this.canLocalControl()) return;
+    const t = this.activeTank;
+    const clamped = Math.max(0, Math.min(180, Math.round(Number(deg) || 0)));
+    if (clamped !== t.rotace) {
+      t.rotace = clamped;
+    }
+  }
+
+  setPower(val) {
+    if (!this.canLocalControl()) return;
+    const t = this.activeTank;
+    const maxPow = getMaxPower(t.data.energy);
+    const clamped = Math.max(0, Math.min(maxPow, Math.round(Number(val) || 0)));
+    t.power = clamped;
+  }
+
+  setFuelMove(dir) {
+    this.holdingFuelLeft = dir < 0;
+    this.holdingFuelRight = dir > 0;
   }
 
   // ==================== ACTIONS (LOCAL + NETWORK SYNC) ====================
@@ -582,7 +618,7 @@ export class TankGame {
     if (!t) return;
     const guns = t.data.guns;
     const n = WEAPONS.length;
-    let idx = t.data.cur_gun;
+    const idx = t.data.cur_gun;
     for (let step = 1; step <= n; step++) {
       const cand = (idx + dir * step + n) % n;
       if (guns[cand] > 0) {
@@ -600,8 +636,13 @@ export class TankGame {
     if (!this._canAct(fromRemote, fromAI)) return;
     const t = targetTank || this.activeTank;
     if (!t || (!fromRemote && (t.data.specials[1] <= 0 || t.data.energy >= t.data.max_energy))) return;
-    t.data.energy = Math.min(t.data.max_energy, Math.round(t.data.energy) + REPAIR_HEAL_AMOUNT);
+    const before = Math.round(t.data.energy);
+    t.data.energy = Math.min(t.data.max_energy, before + REPAIR_HEAL_AMOUNT);
+    const healed = Math.round(t.data.energy) - before;
     t.data.specials[1] = Math.max(0, t.data.specials[1] - 1);
+    if (healed > 0) {
+      this.vfx.spawnPopup(t.x, t.y - 8, `+${healed} HP`, '#16a34a');
+    }
     this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
     if (!fromRemote && this.mode === 'online') {
       this.cb.onOnlineAction?.({
@@ -690,7 +731,6 @@ export class TankGame {
     const gunIdx = t.data.cur_gun;
     const spec = getWeaponSpec(gunIdx);
 
-    // Sync firing state over network before decrementing gun
     if (!fromRemote && this.mode === 'online') {
       this.cb.onOnlineAction?.({
         type: 'fire',
@@ -706,7 +746,6 @@ export class TankGame {
       });
     }
 
-    // Consume ammo (except weapon 0 = Small missile, infinite!)
     if (gunIdx !== 0) {
       t.data.guns[gunIdx] = Math.max(0, t.data.guns[gunIdx] - 1);
       if (t.data.guns[gunIdx] === 0) {
@@ -719,6 +758,8 @@ export class TankGame {
     this.shieldsMenuOpen = false;
     this.shotFlying = true;
     this.keys.fire = false;
+    this.holdingFuelLeft = false;
+    this.holdingFuelRight = false;
     this.sound.stop(SOUNDS.TURRET_MOVE);
 
     if (spec.kind === 'astrike') {
@@ -731,7 +772,6 @@ export class TankGame {
       return;
     }
 
-    // Play barrel recoil animation + firing sound (subtle click/boom from button 148)
     t.barrelFrame = 1;
     t.barrelPlaying = true;
     this.sound.play(SOUNDS.MEDIUM_EXPLODE, { volume: 0.35, minIntervalMs: 40 });
@@ -752,7 +792,6 @@ export class TankGame {
     const ownerNum = this.airStrike.owner?.tankNumber || 0;
     if (uhel !== undefined) this.airStrike.uhel = uhel;
     this.airStrike.launch(this, targetX);
-    // Mark newest strike as justPlanted so it waits a full enemy turn before dropping
     const last = this.pendingStrikes[this.pendingStrikes.length - 1];
     if (last) last.justPlanted = true;
     this.cursorHidden = false;
@@ -766,6 +805,8 @@ export class TankGame {
       });
     }
   }
+
+  // ==================== SERIALIZATION, SAVE/LOAD & ONLINE SYNC ====================
 
   _serializePlayerData() {
     return this.playerData.map((pd) => ({
@@ -789,7 +830,6 @@ export class TankGame {
 
   _applySerializedPlayerData(arr) {
     if (!Array.isArray(arr) || !arr.length) return;
-    // Support cold-boot mid-match rejoin (e.g. after guest refreshes browser tab)
     if (this.playerData.length !== arr.length) {
       this.playerCount = arr.length;
       this.playerData = arr.map((src, idx) =>
@@ -867,8 +907,6 @@ export class TankGame {
     };
   }
 
-  // ==================== MID-GAME SAVE & LOAD ====================
-
   canSaveGame() {
     if (this.scene !== 'battle' && this.scene !== 'shop') return false;
     if (this.scene === 'battle' && (this._hasActiveBattleVisuals() || this.testing || this.roundEndPending)) {
@@ -934,7 +972,6 @@ export class TankGame {
     if (save.rngState !== undefined) this.rng.setState(save.rngState);
     if (save.aiRngState !== undefined) this.aiRng.setState(save.aiRngState);
 
-    // Rebuild playerData cleanly (applying any lobby slot overrides when resuming online)
     const overrides = Array.isArray(opts.slotOverrides) ? opts.slotOverrides : null;
     this.playerData = save.playerData.map((src, idx) => {
       const ov = overrides?.[idx];
@@ -961,6 +998,7 @@ export class TankGame {
       return base;
     });
 
+    this.vfx.clearBattleFx();
     this.projectiles = [];
     this.airStrike = null;
     this.teleport = null;
@@ -968,7 +1006,6 @@ export class TankGame {
     this._aiPendingTeleport = null;
     this.blik = null;
     this.shieldsMenuOpen = false;
-    this.draggingPower = false;
     this.draggingAngle = false;
     this.holdingFuelLeft = false;
     this.holdingFuelRight = false;
@@ -986,18 +1023,7 @@ export class TankGame {
     if (save.scene === 'shop' || !save.terrain) {
       this.tanks = [];
       this.scene = 'shop';
-      this.clona = {
-        projizdi: false,
-        targetScene: 'shop',
-        purchasing: true,
-        openingAfterShop: false,
-        lx: -137.5,
-        rx: 137.0,
-        speed: 0,
-        k: 2340,
-        firstClosed: false,
-        swapped: false,
-      };
+      this._initTitlePanorama(this.krajinaSetting === 0 ? 1 : this.krajinaSetting);
       if (this.mode === 'online') {
         this.shopCur = this.mySlot;
       } else {
@@ -1008,13 +1034,11 @@ export class TankGame {
           this._shopNextPlayer();
         }
       }
-      this.showToast(`Loaded Save (Round ${this.gameRound} Shop)`, '#7ef29d', 65);
+      this.showToast(`Loaded Save (Round ${this.gameRound} Shop)`, '#16a34a', 65);
       this._notifyStatus();
       return;
     }
 
-    // Restore exact battle terrain & tanks
-    this.clona = null;
     this.scene = 'battle';
     this.terrain.deserialize(save.terrain);
 
@@ -1060,10 +1084,15 @@ export class TankGame {
     if (this.activeTank) {
       this.activeTank.firstFrame = true;
       this.activeTank._aiTurnFrames = 0;
-      this.blik = { x: this.activeTank.x, y: this.activeTank.y - 10, frame: 0 };
+      this.blik = {
+        x: this.activeTank.x,
+        y: this.activeTank.y,
+        frame: 0,
+        col: hexIntToCss(this.activeTank.data.col),
+      };
     }
     this.nextTank = this.turnOrder.length ? this.turnOrder[this.turnIdx % this.turnOrder.length] : null;
-    this.showToast(`Loaded Save (Round ${this.gameRound})`, '#7ef29d', 65);
+    this.showToast(`Loaded Save (Round ${this.gameRound})`, '#16a34a', 65);
     this._notifyStatus();
   }
 
@@ -1089,42 +1118,11 @@ export class TankGame {
     if (snap.playerData) this._applySerializedPlayerData(snap.playerData);
 
     if (snap.scene === 'shop') {
-      if (this.scene !== 'shop' && !this.roundTransitioning) {
-        this.roundEndPending = false;
-        this.roundTransitioning = true;
-        if (this.scene !== 'battle') {
-          // Cold-boot directly into open shop after refresh/rejoin
-          this.scene = 'shop';
-          this.shopCur = this.mySlot;
-          this.onlineReadySent = false;
-          this.onlineReadyStatus = '';
-          this.tanks = [];
-          this.projectiles = [];
-          this.clona = {
-            projizdi: false,
-            targetScene: 'shop',
-            purchasing: true,
-            openingAfterShop: false,
-            lx: -137.5,
-            rx: 137.0,
-            speed: 0,
-            k: 2340,
-            firstClosed: false,
-            swapped: false,
-          };
-          this.roundTransitioning = false;
-        } else {
-          this._spawnClona({
-            projizdi: false,
-            targetScene: 'shop',
-            purchasing: true,
-            speed: 10,
-            k: 2340,
-          });
-        }
+      if (this.scene !== 'shop') {
+        this._openShop(true);
       }
       if (snap.forceImmediate) {
-        this.showToast('Synced with host!', '#7ef29d', 50);
+        this.showToast('Synced with host!', '#16a34a', 50);
       }
       this._notifyStatus();
       return;
@@ -1133,7 +1131,6 @@ export class TankGame {
     if (snap.scene !== 'battle') return;
 
     if (this.scene !== 'battle') {
-      this.clona = null;
       this.scene = 'battle';
     }
     if (snap.terrain) {
@@ -1205,11 +1202,16 @@ export class TankGame {
     this.sound.stop(SOUNDS.TURRET_MOVE);
 
     if (this.activeTank && this.activeTank.data.live && this.activeTank.tankNumber !== prevActiveNum) {
-      this.blik = { x: this.activeTank.x, y: this.activeTank.y - 10, frame: 0 };
+      this.blik = {
+        x: this.activeTank.x,
+        y: this.activeTank.y,
+        frame: 0,
+        col: hexIntToCss(this.activeTank.data.col),
+      };
       this.activeTank.onTurnStart();
     }
     if (snap.forceImmediate) {
-      this.showToast('Synced with host!', '#7ef29d', 50);
+      this.showToast('Synced with host!', '#16a34a', 50);
     }
     this._notifyStatus();
   }
@@ -1223,14 +1225,12 @@ export class TankGame {
     );
   }
 
-  // Fast-forward loading or settling frames if a remote peer is slightly ahead (e.g. after tab switch)
   _catchUpForRemote(expectedTankNumber = 0) {
     if (this._pendingStateSync) {
       this.applyStateSync(this._pendingStateSync);
     }
     let guard = 0;
     while (this.scene === 'loading' && guard < 180) {
-      if (this.clona) this.clona = null;
       this.tick();
       guard++;
     }
@@ -1248,7 +1248,6 @@ export class TankGame {
     }
   }
 
-  // Apply live remote aim/position updates (smooth watching of opponent's turn)
   applyRemoteAim(msg) {
     if (this.scene === 'loading') return;
     if (this.scene !== 'battle' || !this.activeTank) return;
@@ -1261,12 +1260,10 @@ export class TankGame {
     if (msg.gun !== undefined) this.activeTank.data.cur_gun = msg.gun;
   }
 
-  // Apply remote turn action
   applyRemoteAction(msg) {
     if (!msg) return;
 
     if (msg.type === 'state_sync') {
-      // Wait briefly if an explosion/death animation is still playing visually so explosions don't get cut off
       if (this.scene === 'battle' && this._hasActiveBattleVisuals() && !msg.forceImmediate) {
         this._pendingStateSync = msg;
         this._pendingStateSyncWait = 0;
@@ -1278,17 +1275,10 @@ export class TankGame {
 
     if (msg.type === 'open_shop') {
       if (msg.playerData) this._applySerializedPlayerData(msg.playerData);
-      if (this.scene !== 'shop' && !this.roundTransitioning) {
+      if (this.scene !== 'shop') {
         this.roundEndPending = false;
-        this.roundTransitioning = true;
         this._pendingStateSync = null;
-        this._spawnClona({
-          projizdi: false,
-          targetScene: 'shop',
-          purchasing: true,
-          speed: 10,
-          k: 2340,
-        });
+        this._openShop(false);
       }
       return;
     }
@@ -1307,13 +1297,12 @@ export class TankGame {
       this._catchUpForRemote(0);
       if (this.scene === 'battle' && msg.strike) {
         if (msg.rngState !== undefined) this.rng.setState(msg.rngState);
-        // Remove matching pending flare locally
         const idx = this.pendingStrikes.findIndex(
           (s) => s.targetX === msg.strike.targetX && s.ownerNum === msg.strike.ownerNum
         );
         if (idx >= 0) this.pendingStrikes.splice(idx, 1);
         spawnAirStrikeBombs(this, msg.strike);
-        this.showToast('AIR STRIKE IMPACT!', '#ff6b6b', 45);
+        this.showToast('AIR STRIKE IMPACT!', '#dc2626', 45);
       }
       return;
     }
@@ -1362,7 +1351,6 @@ export class TankGame {
         this.launchAirStrike(msg.x, msg.uhel, true);
         break;
       case 'fire':
-        // Force activeTank alignment so a remote shot is NEVER dropped
         for (const tk of this.tanks) tk.playing = false;
         this.activeTank = targetTank;
         targetTank.playing = true;
@@ -1379,80 +1367,12 @@ export class TankGame {
     }
   }
 
-  // ==================== BLAST DOORS (CLONA) & SHOP ====================
+  // ==================== ARMORY SHOP ====================
 
-  _spawnClona({ projizdi, targetScene, purchasing, speed = 16, k = 920 }) {
-    this.sound.play(SOUNDS.CLONA_DOOR, { volume: 0.75, noMultiple: true });
-    this.clona = {
-      projizdi,
-      targetScene,
-      purchasing,
-      openingAfterShop: false,
-      lx: -411.35,
-      rx: 412.5,
-      speed,
-      k,
-      firstClosed: true,
-      swapped: false,
-    };
-  }
-
-  _tickClona() {
-    const c = this.clona;
-    if (!c) return;
-
-    if (c.projizdi) {
-      // Slide doors in to center, swap scene, then bounce back open (exact Sprite 247 `l` & `r`)
-      if (c.openingAfterShop) {
-        c.speed -= (137.5 + Math.abs(c.lx)) / c.k;
-        c.lx += c.speed;
-        c.rx -= c.speed;
-        if (c.lx <= -411.35) {
-          this.clona = null;
-        }
-        return;
-      }
-
-      c.speed -= (137.5 + Math.abs(c.lx)) / c.k;
-      if (c.lx > -137.5 && !c.swapped) {
-        c.lx = -137.5;
-        c.rx = 137.5;
-        c.swapped = true;
-        if (c.targetScene === 'menu2') {
-          this._initMenu2();
-        }
-      }
-      c.lx += c.speed;
-      c.rx -= c.speed;
-      if (c.rx < 137.5 && !c.swapped) c.rx = 137.5;
-
-      if (c.speed < 0 && c.lx < -411.35) {
-        this.clona = null;
-      }
-    } else {
-      // Slide doors shut and hold closed for Shop
-      if (c.lx < -137.5) {
-        c.speed -= (137.5 + Math.abs(c.lx)) / c.k;
-        if (c.speed < 1.5) c.speed = 1.5;
-        c.lx += c.speed;
-        c.rx -= c.speed;
-        if (c.lx >= -137.5) {
-          c.lx = -137.5;
-          c.rx = 137.0;
-        }
-      } else {
-        c.lx = -137.5;
-        c.rx = 137.0;
-        if (c.firstClosed) {
-          c.firstClosed = false;
-          this._openShop();
-        }
-      }
-    }
-  }
-
-  _openShop() {
+  _openShop(fromSync = false) {
     this.scene = 'shop';
+    this.roundEndPending = false;
+    this.roundTransitioning = false;
     this.tanks = [];
     this.projectiles = [];
     this.airStrike = null;
@@ -1460,14 +1380,22 @@ export class TankGame {
     this.pendingStrikes = [];
     this.fastForward = false;
     this.blik = null;
-    this.terrain.vitr = 0;
+    this.shieldsMenuOpen = false;
+    this.cursorHidden = false;
+    this.clearKeys();
+
+    // Ensure a lush Paper-Cut landscape is visible behind the frosted Shop overlay
+    if (!this.terrain.cols[0]) {
+      this._initTitlePanorama(this.krajinaSetting === 0 ? 1 : this.krajinaSetting);
+    } else {
+      this.terrain.vitr = 10;
+    }
 
     if (this.mode === 'online') {
-      // Simultaneous shopping for local player's slot; host executes AI shopping and syncs buys
       this.shopCur = this.mySlot;
       this.onlineReadySent = false;
       this.onlineReadyStatus = '';
-      if (this.isHost) {
+      if (this.isHost && !fromSync) {
         for (let slot = 1; slot <= this.playerCount; slot++) {
           if (this.playerData[slot - 1].type === 'ai') {
             aiBuyInShop(slot, this);
@@ -1476,7 +1404,6 @@ export class TankGame {
         this.cb.onAutoSave?.(this.buildSaveData('Auto-Save (Shop)'));
       }
     } else {
-      // Sequential shopping for humans; AI bots buy items with their earned cash
       this.shopCur = 0;
       this._shopNextPlayer();
       if (this.scene === 'shop') {
@@ -1484,6 +1411,10 @@ export class TankGame {
       }
     }
     this._notifyStatus();
+  }
+
+  shopNext() {
+    this._shopNextPlayer();
   }
 
   _shopNextPlayer() {
@@ -1499,34 +1430,29 @@ export class TankGame {
     while (this.shopCur < this.playerCount) {
       this.shopCur += 1;
       if (this.playerData[this.shopCur - 1].type === 'tank') {
-        return; // Human player's turn to shop
+        this._notifyStatus();
+        return;
       }
-      // AI bot shops using its own earned score & exact shop prices
       aiBuyInShop(this.shopCur, this);
     }
 
-    // All players finished shopping -> open doors and start next round!
-    this._prepareRoundData();
-    this.scene = 'loading';
-    this.terrain.beginGenerate(this.krajinaSetting, this.rng, false);
-    if (this.clona) {
-      this.clona.purchasing = false;
-      this.clona.projizdi = true;
-      this.clona.openingAfterShop = true;
-      this.clona.speed = -4;
-      this.sound.play(SOUNDS.CLONA_DOOR, { volume: 0.75, noMultiple: true });
-    }
-    this._notifyStatus();
+    // All players finished shopping -> jump cleanly into next round!
+    this.sound.play(SOUNDS.UI_CLICK, { volume: 0.8 });
+    this._startNextRound();
+  }
+
+  getShopButtonCaption() {
+    return this._shopButtonCaption();
   }
 
   _shopButtonCaption() {
     if (this.mode === 'online') {
-      return this.onlineReadySent ? (this.onlineReadyStatus || 'Waiting...') : 'Ready!';
+      return this.onlineReadySent ? (this.onlineReadyStatus || 'Waiting...') : 'Ready for Next Round';
     }
     for (let i = this.shopCur + 1; i <= this.playerCount; i++) {
-      if (this.playerData[i - 1].type === 'tank') return 'Next player';
+      if (this.playerData[i - 1].type === 'tank') return 'Next Player →';
     }
-    return 'Start!';
+    return 'Start Next Round →';
   }
 
   applyShopPurchase(slot, kind, index, fromRemote = false, silent = false) {
@@ -1558,251 +1484,234 @@ export class TankGame {
 
   // ==================== 25Hz SIMULATION TICK ====================
 
-  tick() {
-    // Blast-door curtain always ticks
-    if (this.clona) {
-      this._tickClona();
-    }
+  tick(viewBounds = null) {
+    // Scenic drifting clouds & weather run across ALL scenes for a living Paper-Cut backdrop
+    this.terrain.tick(viewBounds);
+    this.vfx.tick(this.terrain.krajina, this.terrain.vitr, viewBounds);
 
-    if (this.scene === 'menu2') {
-      // Smoothly fade AI difficulty box (Sprite 394, speed = 2/100 per frame)
-      if (this.setupType === 'ai' && this.setupAiAlpha < 1) {
-        this.setupAiAlpha = Math.min(1, this.setupAiAlpha + 0.04);
-      } else if (this.setupType === 'tank' && this.setupAiAlpha > 0) {
-        this.setupAiAlpha = Math.max(0, this.setupAiAlpha - 0.04);
-      }
-      return;
+    if (this.bannerToast && this.scene !== 'battle') {
+      this.bannerToast.frames--;
+      if (this.bannerToast.frames <= 0) this.bannerToast = null;
     }
 
     if (this.scene === 'loading') {
-      // Wait for clona to finish opening if still covering screen
-      const pct = this.terrain.stepGenerate(this.rng, 40);
-      if (pct >= 100 && !this.clona) {
+      const pct = this.terrain.stepGenerate(this.rng, 180);
+      if (pct >= 100) {
         this._enterBattle();
       }
       return;
     }
 
-    if (this.scene === 'battle') {
-      if (this.fastForward && !this.isBotsOnlyAlive()) {
-        this.fastForward = false;
-      }
-      this.terrain.tick();
+    if (this.scene !== 'battle') return;
 
-      // Turn blink arrow (Sprite 225: 35 frames)
-      if (this.blik) {
-        this.blik.frame++;
-        if (this.blik.frame >= 35) this.blik = null;
-      }
+    if (this.fastForward && !this.isBotsOnlyAlive()) {
+      this.fastForward = false;
+    }
 
-      // Active Air Strike controller
-      if (this._aiPendingAirStrike) {
-        if (!this.airStrike || this.airStrike.launched) {
+    // Turn indicator chevron (35 frames)
+    if (this.blik) {
+      this.blik.frame++;
+      if (this.blik.frame >= 35) this.blik = null;
+    }
+
+    // Active Air Strike controller
+    if (this._aiPendingAirStrike) {
+      if (!this.airStrike || this.airStrike.launched) {
+        this._aiPendingAirStrike = null;
+      } else {
+        this._aiPendingAirStrike.delay--;
+        if (this._aiPendingAirStrike.delay <= 0) {
+          const pending = this._aiPendingAirStrike;
           this._aiPendingAirStrike = null;
-        } else {
-          this._aiPendingAirStrike.delay--;
-          if (this._aiPendingAirStrike.delay <= 0) {
-            const pending = this._aiPendingAirStrike;
-            this._aiPendingAirStrike = null;
-            this.launchAirStrike(pending.x, pending.uhel, false);
-          }
+          this.launchAirStrike(pending.x, pending.uhel, false);
         }
       }
-      if (this.airStrike) {
-        this.airStrike.tick(this);
-        if (this.airStrike.done) this.airStrike = null;
-      }
+    }
+    if (this.airStrike) {
+      this.airStrike.tick(this);
+      if (this.airStrike.done) this.airStrike = null;
+    }
 
-      // Active Teleport controller
-      if (this._aiPendingTeleport) {
-        if (!this.teleport || this.teleport.picked) {
+    // Active Teleport controller
+    if (this._aiPendingTeleport) {
+      if (!this.teleport || this.teleport.picked) {
+        this._aiPendingTeleport = null;
+      } else {
+        this._aiPendingTeleport.delay--;
+        if (this._aiPendingTeleport.delay <= 0) {
+          const pending = this._aiPendingTeleport;
           this._aiPendingTeleport = null;
-        } else {
-          this._aiPendingTeleport.delay--;
-          if (this._aiPendingTeleport.delay <= 0) {
-            const pending = this._aiPendingTeleport;
-            this._aiPendingTeleport = null;
-            this.confirmTeleport(pending.x, pending.y, false);
-          }
+          this.confirmTeleport(pending.x, pending.y, false);
         }
       }
-      if (this.teleport) {
-        this.teleport.tick(this);
-        if (this.teleport.done) this.teleport = null;
+    }
+    if (this.teleport) {
+      this.teleport.tick(this);
+      if (this.teleport.done) this.teleport = null;
+    }
+
+    // Tick all projectiles
+    if (this.projectiles.length) {
+      const snapshot = this.projectiles.slice();
+      for (const proj of snapshot) {
+        proj.tick(this);
       }
+      this.projectiles = this.projectiles.filter((p) => !p.done);
+    }
 
-      // Tick all projectiles (iterate over snapshot so spawned clusters tick cleanly)
-      if (this.projectiles.length) {
-        const snapshot = this.projectiles.slice();
-        for (const proj of snapshot) {
-          proj.tick(this);
-        }
-        this.projectiles = this.projectiles.filter((p) => !p.done);
-      }
-
-      // Tick AI controller if active tank is AI (and locally owned: always in local mode, host-only in online mode)
-      if (this.activeTank && this.activeTank.playing && this.activeTank.type === 'ai') {
-        if (this.mode === 'local' || this.isHost) {
-          try {
-            tickAI(this.activeTank, this);
-          } catch (err) {
-            console.error('AI turn error, falling back to safe shot:', err);
-            this.activeTank.firstFrame = true;
-            this.activeTank.data.cur_gun = 0;
-            this.fireCurrentTank();
-          }
-        }
-      }
-
-      // Build human input for active tank (including HUD fuel buttons)
-      const localCtrl = this.canLocalControl();
-      const activeInput = localCtrl
-        ? {
-            left: this.keys.left || this.holdingFuelLeft,
-            right: this.keys.right || this.holdingFuelRight,
-            angleUp: this.keys.angleUp,
-            angleDown: this.keys.angleDown,
-            powerUp: this.keys.powerUp,
-            powerDown: this.keys.powerDown,
-            fire: this.keys.fire,
-          }
-        : null;
-
-      // Tick all tanks
-      for (const tank of this.tanks) {
-        tank.tick(this, tank === this.activeTank ? activeInput : null);
-      }
-
-      // Sync live aiming / movement over network for local player OR host's AI
-      if (this.mode === 'online' && this.activeTank && this.activeTank.playing) {
-        const isMyTurn =
-          (this.activeTank.type === 'tank' && this.activeTank.tankNumber === this.mySlot) ||
-          (this.activeTank.type === 'ai' && this.isHost);
-        if (isMyTurn) {
-          this._aimSyncCounter++;
-          if (this._aimSyncCounter >= 2) {
-            this._aimSyncCounter = 0;
-            const t = this.activeTank;
-            const sig = `${Math.round(t.x * 10)},${Math.round(t.y * 10)},${Math.round(t.rotace * 2)},${Math.round(t.power * 2)},${t.data.cur_gun}`;
-            if (sig !== this._lastSentAim) {
-              this._lastSentAim = sig;
-              this.cb.onOnlineAim?.({
-                tankNumber: t.tankNumber,
-                x: t.x,
-                y: t.y,
-                rotace: t.rotace,
-                power: t.power,
-                fuel: t.data.fuel,
-                gun: t.data.cur_gun,
-              });
-            }
-          }
+    // Tick AI controller if active tank is AI
+    if (this.activeTank && this.activeTank.playing && this.activeTank.type === 'ai') {
+      if (this.mode === 'local' || this.isHost) {
+        try {
+          tickAI(this.activeTank, this);
+        } catch (err) {
+          console.error('AI turn error, falling back to safe shot:', err);
+          this.activeTank.firstFrame = true;
+          this.activeTank.data.cur_gun = 0;
+          this.fireCurrentTank();
         }
       }
+    }
 
-      // Banner toast countdown
-      if (this.bannerToast) {
-        this.bannerToast.frames--;
-        if (this.bannerToast.frames <= 0) this.bannerToast = null;
-      }
-
-      // Pulse pending Air Strike flares
-      for (const s of this.pendingStrikes) {
-        s.pulse = ((s.pulse || 0) + 1) % 30;
-      }
-
-      // Optional Turn Timer countdown (auto-acts on timeout so rounds never stall)
-      if (
-        this.turnTimerSec > 0 &&
-        this.activeTank &&
-        this.activeTank.type === 'tank' &&
-        (this.activeTank.playing || (this.airStrike && !this.airStrike.launched) || (this.teleport && !this.teleport.picked))
-      ) {
-        if (this.turnTicksLeft > 0) {
-          this.turnTicksLeft--;
+    // Build human input for active tank (keyboard + bottom-dock fuel hold buttons)
+    const localCtrl = this.canLocalControl();
+    const activeInput = localCtrl
+      ? {
+          left: this.keys.left || this.holdingFuelLeft,
+          right: this.keys.right || this.holdingFuelRight,
+          angleUp: this.keys.angleUp,
+          angleDown: this.keys.angleDown,
+          powerUp: this.keys.powerUp,
+          powerDown: this.keys.powerDown,
+          fire: this.keys.fire,
         }
-        if (this.turnTicksLeft <= 0 && (this.canLocalControl() || this.canLocalControlSpecialOverlay())) {
-          if (this.airStrike && !this.airStrike.launched) {
-            this.launchAirStrike(this.airStrike.cursorX, this.airStrike.uhel);
-          } else if (this.teleport && !this.teleport.picked) {
-            this.confirmTeleport(this.teleport.cursorX, this.teleport.cursorY);
-          } else if (this.activeTank.playing) {
-            this.showToast(`${this.activeTank.data.name} time up! Auto-firing...`, '#ff9b6a', 45);
-            this.fireCurrentTank();
-          }
-        }
-      }
+      : null;
 
-      // Apply deferred authoritative host state_sync once current explosion/death visuals finish
-      if (this._pendingStateSync) {
-        this._pendingStateSyncWait++;
-        if (!this._hasActiveBattleVisuals() || this._pendingStateSyncWait >= 20) {
-          this.applyStateSync(this._pendingStateSync);
-          return;
-        }
-      }
+    // Tick all tanks
+    for (const tank of this.tanks) {
+      tank.tick(this, tank === this.activeTank ? activeInput : null);
+    }
 
-      // Settling & round-end check
-      if (this.testing && !this.projectiles.length && !this.airStrike && !this.teleport) {
-        let anyTesting = false;
-        for (const tank of this.tanks) {
-          if (tank.dying || (tank.testing && tank.data.live)) {
-            anyTesting = true;
-            break;
-          }
-        }
-        if (!anyTesting) {
-          this.testing = false;
-          if (this.aliveCount > 1) {
-            // In online mode, host processes delayed Air Strikes & advances turn authoritatively
-            if (this.mode !== 'online' || this.isHost) {
-              const droppedStrike = this._processPendingStrikes();
-              if (!droppedStrike) {
-                this.nextPlayer();
-              }
-            }
-          }
-        }
-      }
-
-      // Check round end (< 2 tanks alive and everything settled)
-      // In online mode, host awards round payouts and triggers open_shop authoritatively
-      if (
-        (this.mode !== 'online' || this.isHost) &&
-        this.aliveCount < 2 &&
-        !this.roundEndPending &&
-        !this.roundTransitioning &&
-        !this.clona &&
-        !this.testing &&
-        !this.projectiles.length &&
-        !this.airStrike &&
-        !this.teleport &&
-        !this.tanks.some((t) => t.dying)
-      ) {
-        this._awardRoundEndPayouts();
-        this.roundEndPending = true;
-        this.roundEndTimer = 0;
-      }
-
-      if (this.roundEndPending) {
-        this.roundEndTimer++;
-        if (this.roundEndTimer >= 36) {
-          this.roundEndPending = false;
-          this.roundTransitioning = true;
-          if (this.mode === 'online' && this.isHost) {
-            this.cb.onOnlineAction?.({
-              type: 'open_shop',
-              playerData: this._serializePlayerData(),
+    // Sync live aiming / movement over network for local player OR host's AI
+    if (this.mode === 'online' && this.activeTank && this.activeTank.playing) {
+      const isMyTurn =
+        (this.activeTank.type === 'tank' && this.activeTank.tankNumber === this.mySlot) ||
+        (this.activeTank.type === 'ai' && this.isHost);
+      if (isMyTurn) {
+        this._aimSyncCounter++;
+        if (this._aimSyncCounter >= 2) {
+          this._aimSyncCounter = 0;
+          const t = this.activeTank;
+          const sig = `${Math.round(t.x * 10)},${Math.round(t.y * 10)},${Math.round(t.rotace * 2)},${Math.round(t.power * 2)},${t.data.cur_gun}`;
+          if (sig !== this._lastSentAim) {
+            this._lastSentAim = sig;
+            this.cb.onOnlineAim?.({
+              tankNumber: t.tankNumber,
+              x: t.x,
+              y: t.y,
+              rotace: t.rotace,
+              power: t.power,
+              fuel: t.data.fuel,
+              gun: t.data.cur_gun,
             });
           }
-          this._spawnClona({
-            projizdi: false,
-            targetScene: 'shop',
-            purchasing: true,
-            speed: 10,
-            k: 2340,
+        }
+      }
+    }
+
+    // Banner toast countdown
+    if (this.bannerToast) {
+      this.bannerToast.frames--;
+      if (this.bannerToast.frames <= 0) this.bannerToast = null;
+    }
+
+    // Pulse pending Air Strike flares
+    for (const s of this.pendingStrikes) {
+      s.pulse = ((s.pulse || 0) + 1) % 30;
+    }
+
+    // Optional Turn Timer countdown
+    if (
+      this.turnTimerSec > 0 &&
+      this.activeTank &&
+      this.activeTank.type === 'tank' &&
+      (this.activeTank.playing || (this.airStrike && !this.airStrike.launched) || (this.teleport && !this.teleport.picked))
+    ) {
+      if (this.turnTicksLeft > 0) {
+        this.turnTicksLeft--;
+      }
+      if (this.turnTicksLeft <= 0 && (this.canLocalControl() || this.canLocalControlSpecialOverlay())) {
+        if (this.airStrike && !this.airStrike.launched) {
+          this.launchAirStrike(this.airStrike.cursorX, this.airStrike.uhel);
+        } else if (this.teleport && !this.teleport.picked) {
+          this.confirmTeleport(this.teleport.cursorX, this.teleport.cursorY);
+        } else if (this.activeTank.playing) {
+          this.showToast(`${this.activeTank.data.name} time up! Auto-firing...`, '#ea580c', 45);
+          this.fireCurrentTank();
+        }
+      }
+    }
+
+    // Apply deferred authoritative host state_sync once current explosion/death visuals finish
+    if (this._pendingStateSync) {
+      this._pendingStateSyncWait++;
+      if (!this._hasActiveBattleVisuals() || this._pendingStateSyncWait >= 20) {
+        this.applyStateSync(this._pendingStateSync);
+        return;
+      }
+    }
+
+    // Settling & round-end check
+    if (this.testing && !this.projectiles.length && !this.airStrike && !this.teleport) {
+      let anyTesting = false;
+      for (const tank of this.tanks) {
+        if (tank.dying || (tank.testing && tank.data.live)) {
+          anyTesting = true;
+          break;
+        }
+      }
+      if (!anyTesting) {
+        this.testing = false;
+        if (this.aliveCount > 1) {
+          if (this.mode !== 'online' || this.isHost) {
+            const droppedStrike = this._processPendingStrikes();
+            if (!droppedStrike) {
+              this.nextPlayer();
+            }
+          }
+        }
+      }
+    }
+
+    // Check round end (< 2 tanks alive and everything settled)
+    if (
+      (this.mode !== 'online' || this.isHost) &&
+      this.aliveCount < 2 &&
+      !this.roundEndPending &&
+      !this.roundTransitioning &&
+      !this.testing &&
+      !this.projectiles.length &&
+      !this.airStrike &&
+      !this.teleport &&
+      !this.tanks.some((t) => t.dying)
+    ) {
+      this._awardRoundEndPayouts();
+      this.roundEndPending = true;
+      this.roundEndTimer = 0;
+    }
+
+    if (this.roundEndPending) {
+      this.roundEndTimer++;
+      if (this.roundEndTimer >= 36) {
+        this.roundEndPending = false;
+        this.roundTransitioning = true;
+        if (this.mode === 'online' && this.isHost) {
+          this.cb.onOnlineAction?.({
+            type: 'open_shop',
+            playerData: this._serializePlayerData(),
           });
         }
+        this._openShop(false);
       }
     }
   }
@@ -1812,33 +1721,6 @@ export class TankGame {
   handleKeyDown(e) {
     this.sound.unlock();
     const code = e.code;
-    const key = e.key;
-
-    // Menu 2 Name text typing
-    if (this.scene === 'menu2' && !this.clona) {
-      if (code === 'Enter') {
-        e.preventDefault();
-        this._confirmMenu2Player();
-        return;
-      }
-      if (code === 'Backspace') {
-        e.preventDefault();
-        this.setupName = this.setupName.slice(0, -1);
-        return;
-      }
-      if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && this.setupName.length < 14) {
-        e.preventDefault();
-        this.setupName += key;
-        return;
-      }
-      return;
-    }
-
-    if (this.scene === 'menu1' && !this.clona && code === 'Enter') {
-      e.preventDefault();
-      this._confirmMenu1();
-      return;
-    }
 
     if (this.scene === 'shop' && code === 'Enter') {
       e.preventDefault();
@@ -1848,7 +1730,7 @@ export class TankGame {
 
     if (this.scene !== 'battle') return;
 
-    // Air strike direction flip (Left/Right arrows, exact Sprite 65)
+    // Air strike direction flip
     if (this.airStrike && !this.airStrike.launched && this.canLocalControlSpecialOverlay()) {
       if (code === 'ArrowLeft') {
         e.preventDefault();
@@ -1864,7 +1746,6 @@ export class TankGame {
 
     if (!this.canLocalControl()) return;
 
-    // Weapon cycling: Q / E
     if (code === 'KeyQ') {
       e.preventDefault();
       this.cycleWeapon(-1);
@@ -1876,7 +1757,6 @@ export class TankGame {
       return;
     }
 
-    // Power: PageUp / PageDown or W / S
     if (code === 'PageUp' || code === 'KeyW') {
       e.preventDefault();
       this.keys.powerUp = true;
@@ -1917,10 +1797,10 @@ export class TankGame {
     for (const k of Object.keys(this.keys)) this.keys[k] = false;
     this.holdingFuelLeft = false;
     this.holdingFuelRight = false;
-    this.draggingPower = false;
     this.draggingAngle = false;
   }
 
+  // Canvas pointer events are ONLY for Teleport & Air Strike destination targeting
   handleMouseMove(sx, sy) {
     this.mouseX = sx;
     this.mouseY = sy;
@@ -1933,60 +1813,6 @@ export class TankGame {
       this.teleport.cursorX = sx;
       this.teleport.cursorY = sy;
     }
-
-    if (this.scene === 'battle' && this.canLocalControl()) {
-      const t = this.activeTank;
-      // Power slider drag (panel (442.6, 28.4) + pow (-283.6, -25.9), sy = 0.44087)
-      if (this.draggingPower) {
-        const localY = (sy - (PANEL_Y - 25.9)) / 0.440872;
-        const maxPow = getMaxPower(t.data.energy);
-        const minY = Math.max(0, 100 - maxPow);
-        const clampedY = Math.max(minY, Math.min(100, localY));
-        t.power = Math.round(100 - clampedY);
-      }
-      // Angle slider drag (panel (442.6, 28.4) + angle (-227.3, -22.0), sx = 0.31676)
-      if (this.draggingAngle) {
-        const localX = (sx - (PANEL_X - 227.3)) / 0.316757;
-        const clampedX = Math.max(-90, Math.min(90, localX));
-        t.rotace = Math.round(90 + clampedX);
-        this.sound.play(SOUNDS.TURRET_MOVE, { volume: 0.35, noMultiple: true });
-      }
-      // Track hovered Battle HUD button for over/down states & tooltips
-      const px = sx - PANEL_X;
-      const py = sy - PANEL_Y;
-      this.hoverHudButton = 0;
-      this.hoverShieldTier = 0;
-      if (this.shieldsMenuOpen) {
-        const fx = -356.8;
-        const fy = -3.5;
-        if (Math.abs(px - fx) > 44 || Math.abs(py - fy) > 16) {
-          this.shieldsMenuOpen = false;
-        } else {
-          const xs = [-28.5, -13.9, 0.0, 14.3, 28.2];
-          const btnIds = [194, 198, 206, 213, 219];
-          for (let i = 0; i < 5; i++) {
-            if (Math.abs(px - (fx + xs[i])) <= 7.5 && Math.abs(py - fy) <= 10) {
-              if (i < 4) this.hoverShieldTier = i + 1;
-              this.hoverHudButton = btnIds[i];
-              break;
-            }
-          }
-        }
-      } else if (py >= -28 && py <= 23) {
-        if (this._inBox(px, py, -226, 1, -198, 21)) this.hoverHudButton = 148;
-        else if (py >= -26 && py <= -7 && px >= -190 && px <= -171) this.hoverHudButton = 122;
-        else if (py >= -26 && py <= -7 && px >= -51 && px <= -32) this.hoverHudButton = 123;
-        else if (py >= -11 && py <= 4 && px >= -428 && px <= -412) this.hoverHudButton = 136;
-        else if (py >= -11 && py <= 4 && px >= -388 && px <= -372) this.hoverHudButton = 137;
-        else if (this._inBox(px, py, -395, 4, -365, 22)) this.hoverHudButton = 166;
-        else if (this._inBox(px, py, -365, 4, -335, 22)) this.hoverHudButton = t.par ? 176 : 173;
-        else if (this._inBox(px, py, -335, 4, -305, 22)) this.hoverHudButton = 182;
-        else if (this._inBox(px, py, -365, -11, -349, 4)) this.hoverHudButton = 188;
-      }
-    } else {
-      this.hoverHudButton = 0;
-      this.hoverShieldTier = 0;
-    }
   }
 
   handleMouseDown(sx, sy) {
@@ -1995,41 +1821,8 @@ export class TankGame {
     this.mouseY = sy;
     this.mouseDown = true;
 
-    // Teleport target click (Sprite 305 mouseDown)
     if (this.scene === 'battle' && this.teleport && !this.teleport.picked && this.canLocalControlSpecialOverlay()) {
       this.confirmTeleport(sx, sy);
-      return;
-    }
-
-    if (this.scene === 'battle' && this.canLocalControl()) {
-      const px = sx - PANEL_X;
-      const py = sy - PANEL_Y;
-
-      // Power slider grab (panel-local x around -283.6 ± 10, y -26..+20)
-      if (px >= -294 && px <= -273 && py >= -28 && py <= 20) {
-        this.draggingPower = true;
-        this.handleMouseMove(sx, sy);
-        return;
-      }
-      // Angle slider grab (panel-local x around -227.3 ± 30, y -28..-16)
-      if (px >= -258 && px <= -196 && py >= -28 && py <= -16) {
-        this.draggingAngle = true;
-        this.handleMouseMove(sx, sy);
-        return;
-      }
-      // Fuel Left/Right buttons (Sprite 139 at (-400.15, -2.9), buttons at ±19.4)
-      if (!this.shieldsMenuOpen && py >= -11 && py <= 4) {
-        if (px >= -428 && px <= -412) {
-          this.holdingFuelLeft = true;
-          this.sound.play(SOUNDS.UI_CLICK, { volume: 0.6 });
-          return;
-        }
-        if (px >= -388 && px <= -372) {
-          this.holdingFuelRight = true;
-          this.sound.play(SOUNDS.UI_CLICK, { volume: 0.6 });
-          return;
-        }
-      }
     }
   }
 
@@ -2037,825 +1830,143 @@ export class TankGame {
     this.mouseX = sx;
     this.mouseY = sy;
     this.mouseDown = false;
-    const wasDraggingAngle = this.draggingAngle;
-    const wasDragging = this.draggingPower || this.draggingAngle || this.holdingFuelLeft || this.holdingFuelRight;
-    this.draggingPower = false;
-    this.draggingAngle = false;
-    if (wasDraggingAngle) this.sound.stop(SOUNDS.TURRET_MOVE);
-    this.holdingFuelLeft = false;
-    this.holdingFuelRight = false;
 
-    // Air strike target launch (Sprite 65 mouseUp)
     if (this.scene === 'battle' && this.airStrike && !this.airStrike.launched && this.canLocalControlSpecialOverlay()) {
       this.launchAirStrike(sx, this.airStrike.uhel);
-      return;
-    }
-
-    if (wasDragging || this.clona && this.scene !== 'shop') return;
-
-    if (this.scene === 'menu1') {
-      this._clickMenu1(sx, sy);
-    } else if (this.scene === 'menu2') {
-      this._clickMenu2(sx, sy);
-    } else if (this.scene === 'battle') {
-      this._clickBattleHUD(sx, sy);
-    } else if (this.scene === 'shop') {
-      this._clickShop(sx, sy);
     }
   }
 
-  _inBox(x, y, x1, y1, x2, y2) {
-    return x >= x1 && x <= x2 && y >= y1 && y <= y2;
-  }
+  // ==================== FULL-VIEWPORT CLEAN PAPER-CUT RENDERING ====================
 
-  _confirmMenu1() {
-    if (this.menu1Released) return;
-    this.menu1Released = true;
-    this.sound.play(SOUNDS.UI_CLICK, { volume: 0.8 });
-    this._spawnClona({
-      projizdi: true,
-      targetScene: 'menu2',
-      purchasing: false,
-      speed: 16,
-      k: 920,
-    });
-  }
+  render(ctx, viewBounds = null) {
+    const vb = viewBounds || { left: 0, right: STAGE_W, top: 0, bottom: STAGE_H };
+    ctx.save();
 
-  _clickMenu1(sx, sy) {
-    if (this.menu1Released) return;
-    // Terrain radio rows inside Sprite 331 at (80.7, 217.6):
-    // m1 (Mountains=1) y=-30 -> stage 187.6; m2 (Forest=2) y=-10 -> 207.6; m3 (Desert=3) y=+10 -> 227.6; m4 (Random=0) y=+30 -> 247.6
-    const terrainRows = [
-      { k: 1, cy: 188 },
-      { k: 2, cy: 208 },
-      { k: 3, cy: 228 },
-      { k: 0, cy: 248 },
-    ];
-    for (const r of terrainRows) {
-      if (this._inBox(sx, sy, 68, r.cy - 9, 185, r.cy + 9)) {
-        this.krajinaSetting = r.k;
-        this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
-        return;
+    // 1. Edge-to-edge atmospheric sky, sun, soft clouds & geometric mountain silhouettes
+    this.terrain.renderBackground(ctx, vb);
+
+    // 2. Wind-driven ambient weather (snowflakes, forest leaves, desert sand motes)
+    this.vfx.renderWeather(ctx, this.terrain.krajina);
+
+    // 3. Apply subtle explosion micro-shake to foreground battlefield only
+    if (this.scene === 'battle') {
+      const [shakeX, shakeY] = this.vfx.getShakeOffset();
+      if (shakeX || shakeY) {
+        ctx.translate(shakeX, shakeY);
       }
     }
 
-    // Player count + / - inside Sprite 344 at (94.5, 343.2):
-    // '-' Button 343 at local (17.5, 0) -> stage (112, 343.2)
-    // '+' Button 342 at local (40.0, 0) -> stage (134.5, 343.2)
-    if (this._inBox(sx, sy, 101, 330, 123, 356)) {
-      if (this.playerCount > 2) {
-        this.playerCount--;
-        this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
-      }
-      return;
-    }
-    if (this._inBox(sx, sy, 124, 330, 148, 356)) {
-      if (this.playerCount < 5) {
-        this.playerCount++;
-        this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
-      }
-      return;
-    }
+    // 4. Destructible terrain + seamless edge skirts (arena edge lines only during battle)
+    this.terrain.renderColumns(ctx, vb, this.scene === 'battle');
 
-    // Next arrow Button 335 at (516.5, 373.6), bounds [500.4, 535.3, 361.2, 385.9]
-    if (this._inBox(sx, sy, 496, 358, 540, 390)) {
-      this._confirmMenu1();
-    }
-  }
+    // 5. Two-tone faceted Paper-Cut trees
+    this.terrain.renderTrees(ctx);
 
-  _confirmMenu2Player() {
-    if (this.setupCur > this.playerCount) return;
-    this.sound.play(SOUNDS.UI_CLICK, { volume: 0.8 });
-    const pd = this.playerData[this.setupCur - 1];
-    pd.name = this.setupName.trim() || `Player ${this.setupCur}`;
-    pd.col = PLAYER_COLORS[this.setupColorIdx];
-    pd.type = this.setupType;
-    if (this.setupType === 'ai') pd.dif = this.setupDif;
-
-    this.setupName = '';
-    this.setupCur++;
-    if (this.setupCur > this.playerCount) {
-      this._startNextRound();
-    }
-  }
-
-  _clickMenu2(sx, sy) {
-    // 6 Color radios inside Sprite 377 at (244.9, 228.8), x offsets: -35, -15, +5, +25, +45, +65
-    const colorOffsets = [-35, -15, 5, 25, 45, 65];
-    for (let i = 0; i < 6; i++) {
-      const cx = 244.9 + colorOffsets[i];
-      if (this._inBox(sx, sy, cx - 9, 219, cx + 9, 239)) {
-        this.setupColorIdx = i;
-        this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
-        return;
-      }
-    }
-
-    // Computer controlled checkbox at (310.1, 251.3)
-    if (this._inBox(sx, sy, 298, 240, 322, 263)) {
-      this.setupType = this.setupType === 'tank' ? 'ai' : 'tank';
-      this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
-      return;
-    }
-
-    // AI difficulty radios inside Sprite 394 (397.4, 219.9) -> Sprite 393 (+32.9, +10.7) = (430.3, 230.6)
-    // m1..m5 at y offsets: -50, -25, 0, +25, +50
-    if (this.setupType === 'ai') {
-      const difY = [-50, -25, 0, 25, 50];
-      for (let i = 0; i < 5; i++) {
-        const cy = 230.6 + difY[i];
-        if (this._inBox(sx, sy, 352, cy - 11, 444, cy + 11)) {
-          this.setupDif = AI_DIFFICULTIES[i];
-          this.sound.play(SOUNDS.UI_CLICK, { volume: 0.7 });
-          return;
-        }
-      }
-    }
-
-    // Next / START! button 379 at (292.6, 272.8), bounds [276.5, 311.4, 260.4, 285.1]
-    if (this._inBox(sx, sy, 272, 257, 316, 289)) {
-      this._confirmMenu2Player();
-    }
-  }
-
-  _clickBattleHUD(sx, sy) {
-    const px = sx - PANEL_X;
-    const py = sy - PANEL_Y;
-
-    // Quality radio buttons (always clickable): rad1..3 at (50.8, -20.1 / -5.0 / +10.0)
-    if (px >= 42 && px <= 105) {
-      if (py >= -27 && py <= -13) { this.quality = 'HIGH'; this.sound.play(SOUNDS.UI_CLICK, { volume: 0.5 }); return; }
-      if (py >= -12 && py <= 2) { this.quality = 'MEDIUM'; this.sound.play(SOUNDS.UI_CLICK, { volume: 0.5 }); return; }
-      if (py >= 3 && py <= 18) { this.quality = 'LOW'; this.sound.play(SOUNDS.UI_CLICK, { volume: 0.5 }); return; }
-    }
-
-    if (!this.canLocalControl()) return;
-
-    // Shields flyout menu when open (centered at (-356.8, -3.5))
-    if (this.shieldsMenuOpen) {
-      const fx = -356.8;
-      const fy = -3.5;
-      const xs = [-28.5, -13.9, 0.0, 14.3, 28.2];
-      for (let i = 0; i < 5; i++) {
-        if (Math.abs(px - (fx + xs[i])) <= 7.5 && Math.abs(py - fy) <= 10) {
-          if (i < 4) this.activateShield(i + 1);
-          else this.disableShield();
-          return;
-        }
-      }
-      this.shieldsMenuOpen = false;
-      return;
-    }
-
-    // Weapon selector prev / next (ico at (-110.9, -17.1), btn122 at -70, btn123 at +69)
-    if (py >= -26 && py <= -7) {
-      if (px >= -190 && px <= -171) { this.cycleWeapon(-1); return; }
-      if (px >= -51 && px <= -32) { this.cycleWeapon(1); return; }
-    }
-
-    // Fire button (148 at (-212.45, 10.65), bounds [-224, -200, 2, 19])
-    if (this._inBox(px, py, -226, 1, -198, 21)) {
-      this.fireCurrentTank();
-      return;
-    }
-
-    // Repair button (168 at (-386.4, 12.8))
-    if (this._inBox(px, py, -395, 4, -365, 22)) {
-      this.useRepair();
-      return;
-    }
-
-    // Parachutes toggle button (177 at (-356.7, 13.0))
-    if (this._inBox(px, py, -365, 4, -335, 22)) {
-      this.toggleParachute();
-      return;
-    }
-
-    // Teleport button (184 at (-326.4, 13.0))
-    if (this._inBox(px, py, -335, 4, -305, 22)) {
-      this.beginTeleport();
-      return;
-    }
-
-    // Shields button (221 at (-356.8, -3.5))
-    if (this._inBox(px, py, -365, -11, -349, 4)) {
-      this.shieldsMenuOpen = true;
-      this.sound.play(SOUNDS.UI_CLICK, { volume: 0.6 });
-      return;
-    }
-  }
-
-  _clickShop(sx, sy) {
-    if (this.mode === 'online' && this.onlineReadySent) return;
-    // Shop coordinates are in clona space centered at (275, 200)
-    const cx = sx - 275;
-    const cy = sy - 200;
-
-    // Weapons column: x = -140, width [-82, 102], y = -140 + 18.1 * i
-    for (let i = 0; i < WEAPONS.length; i++) {
-      const ry = -140 + 18.1 * i;
-      if (this._inBox(cx, cy, -222, ry - 8.5, -38, ry + 8.5)) {
-        this.applyShopPurchase(this.shopCur, 'weapon', i);
-        return;
-      }
-    }
-
-    // Specials column: x = +140, width [-82, 102], y = -140 + 17.7 * i (exact Sprite 256 _height = 17.7)
-    for (let i = 0; i < SPECIALS.length; i++) {
-      const ry = -140 + 17.7 * i;
-      if (this._inBox(cx, cy, 58, ry - 8.5, 242, ry + 8.5)) {
-        this.applyShopPurchase(this.shopCur, 'special', i);
-        return;
-      }
-    }
-
-    // Next player / Start! / Ready! button (`buymenu` at (+140, +80), bounds [-55, 55, -13, 15.3])
-    if (this._inBox(cx, cy, 85, 65, 195, 97)) {
-      this._shopNextPlayer();
-    }
-  }
-
-  // ==================== RENDERING ====================
-
-  render(ctx) {
-    ctx.save();
-    ctx.fillStyle = '#000099';
-    ctx.fillRect(0, 0, STAGE_W, STAGE_H);
-
-    if (this.scene === 'menu1') {
-      this._renderMenu1(ctx);
-    } else if (this.scene === 'menu2') {
-      this._renderMenu2(ctx);
-    } else if (this.scene === 'loading') {
-      this._renderLoading(ctx);
-    } else if (this.scene === 'battle') {
-      this._renderBattle(ctx);
-    }
-
-    // Render blast doors (`clona`) & Shop overlay if active
-    if (this.clona) {
-      this._renderClona(ctx);
+    // 6. Active combat entities & Paper-Cut VFX
+    if (this.scene === 'battle') {
+      this._renderBattleEntities(ctx);
     }
 
     ctx.restore();
   }
 
-  _renderMenu1(ctx) {
-    const renderer = this.renderer;
-    // Background bitmap (Sprite 320 at 274.9, 199.9)
-    ctx.save();
-    ctx.translate(274.9, 199.9);
-    renderer.drawSprite(ctx, 320);
-    ctx.restore();
-
-    // Box Shape 321
-    renderer.drawShape(ctx, 321);
-
-    // Static headings & controls text
-    ctx.save(); ctx.translate(240.55, 195.0); ctx.scale(1, 0.92); renderer.drawText(ctx, 322); ctx.restore();
-    ctx.save(); ctx.translate(70.0, 148.8);   renderer.drawText(ctx, 336); ctx.restore();
-    ctx.save(); ctx.translate(86.0, 260.0);   renderer.drawText(ctx, 337); ctx.restore();
-    ctx.save(); ctx.translate(221.85, 148.85); renderer.drawText(ctx, 338); ctx.restore();
-    ctx.save(); ctx.translate(53.55, 285.4);  ctx.scale(1, 0.92); renderer.drawText(ctx, 339); ctx.restore();
-
-    // Terrain selector Sprite 331 at (80.65, 217.6)
-    ctx.save();
-    ctx.translate(80.65, 217.6);
-    renderer.drawSprite(ctx, 331, {
-      overrides: {
-        m1: { frame: this.krajinaSetting === 1 ? 1 : 0 },
-        m2: { frame: this.krajinaSetting === 2 ? 1 : 0 },
-        m3: { frame: this.krajinaSetting === 3 ? 1 : 0 },
-        m4: { frame: this.krajinaSetting === 0 ? 1 : 0 },
-      },
-    });
-    ctx.restore();
-
-    // Player count Sprite 344 at (94.5, 343.2)
-    ctx.save();
-    ctx.translate(94.5, 343.2);
-    renderer.drawSprite(ctx, 344, {
-      vars: { pocet: String(this.playerCount) },
-    });
-    ctx.restore();
-
-    // Next arrow button at (516.5, 373.55)
-    const overNext = this._inBox(this.mouseX, this.mouseY, 496, 358, 540, 390);
-    ctx.save();
-    ctx.translate(516.5, 373.55);
-    ctx.scale(0.342, 0.342);
-    renderer.drawButton(ctx, 335, undefined, overNext ? (this.mouseDown ? 'down' : 'over') : 'up');
-    ctx.restore();
-  }
-
-  _renderMenu2(ctx) {
-    const renderer = this.renderer;
-    // Background bitmap
-    ctx.save();
-    ctx.translate(274.9, 199.9);
-    renderer.drawSprite(ctx, 320);
-    ctx.restore();
-
-    // Main setup panel shape 362
-    renderer.drawShape(ctx, 362);
-
-    // Checkbox Sprite 365 (`check`) at (310.1, 251.3)
-    ctx.save();
-    ctx.translate(310.1, 251.3);
-    renderer.drawSprite(ctx, 365, { frame: this.setupType === 'ai' ? 1 : 0 });
-    ctx.restore();
-
-    // Player header (`cislo`: "Player 1"..) at (148.9, 154.8)
-    ctx.save();
-    ctx.translate(148.9, 154.8);
-    renderer.drawEditText(ctx, 367, undefined, { cislo: `Player ${this.setupCur}` });
-    ctx.restore();
-
-    // "Name:" label & input box
-    ctx.save(); ctx.translate(156.0, 193.8); renderer.drawText(ctx, 368); ctx.restore();
-    ctx.save();
-    ctx.translate(204.0, 193.8);
-    renderer.drawEditText(ctx, 369, undefined, { name: this.setupName });
-    ctx.restore();
-
-    // "Color:" label & 6-color picker Sprite 377 at (244.9, 228.85)
-    ctx.save(); ctx.translate(156.0, 220.0); renderer.drawText(ctx, 370); ctx.restore();
-    ctx.save();
-    ctx.translate(244.9, 228.85);
-    renderer.drawSprite(ctx, 377, {
-      overrides: {
-        m1: { frame: this.setupColorIdx === 0 ? 1 : 0 },
-        m2: { frame: this.setupColorIdx === 1 ? 1 : 0 },
-        m3: { frame: this.setupColorIdx === 2 ? 1 : 0 },
-        m4: { frame: this.setupColorIdx === 3 ? 1 : 0 },
-        m5: { frame: this.setupColorIdx === 4 ? 1 : 0 },
-        m6: { frame: this.setupColorIdx === 5 ? 1 : 0 },
-      },
-    });
-    ctx.restore();
-
-    // "computer controlled:" label
-    ctx.save(); ctx.translate(156.0, 243.3); renderer.drawText(ctx, 380); ctx.restore();
-
-    // Bottom caption (`uk`: "Next player" or "START ! ") & Next button
-    const ukText = this.setupCur === this.playerCount ? 'START ! ' : 'Next player';
-    ctx.save();
-    ctx.translate(137.15, 261.6);
-    renderer.drawEditText(ctx, 378, undefined, { uk: ukText });
-    ctx.restore();
-
-    const overNext = this._inBox(this.mouseX, this.mouseY, 272, 257, 316, 289);
-    ctx.save();
-    ctx.translate(292.6, 272.75);
-    ctx.scale(0.342, 0.342);
-    renderer.drawButton(ctx, 379, undefined, overNext ? (this.mouseDown ? 'down' : 'over') : 'up');
-    ctx.restore();
-
-    // AI difficulty side panel Sprite 394 at (397.4, 219.9)
-    if (this.setupAiAlpha > 0.01) {
-      ctx.save();
-      ctx.translate(397.4, 219.9);
-      renderer.drawSprite(ctx, 394, {
-        cx: alphaCx(this.setupAiAlpha),
-        overrides: {
-          '#393': {
-            overrides: {
-              m1: { frame: this.setupDif === 'Very_easy' ? 1 : 0 },
-              m2: { frame: this.setupDif === 'easy' ? 1 : 0 },
-              m3: { frame: this.setupDif === 'normal' ? 1 : 0 },
-              m4: { frame: this.setupDif === 'hard' ? 1 : 0 },
-              m5: { frame: this.setupDif === 'very_hard' ? 1 : 0 },
-            },
-          },
-        },
-      });
-      ctx.restore();
-    }
-  }
-
-  _renderLoading(ctx) {
-    const renderer = this.renderer;
-    const pct = this.terrain._genState
-      ? Math.min(100, Math.round((this.terrain._genState.i / STAGE_W) * 100))
-      : 100;
-    const barW = pct * 2; // 0..200
-    const barX = -95.3 + pct;
-    ctx.save();
-    ctx.translate(275, 200);
-    renderer.drawSprite(ctx, 399, {
-      overrides: {
-        percent: {
-          x: barX,
-          y: 0,
-          xscale: Math.max(0.01, barW / 200),
-          yscale: 1,
-        },
-      },
-    });
-    ctx.restore();
-  }
-
-  _renderBattle(ctx) {
-    const renderer = this.renderer;
-
-    // 1. Landscape sky/mountains/sun/clouds
-    this.terrain.renderBackground(ctx, renderer);
-
-    // 2. Terrain 550 vertical columns
-    this.terrain.renderColumns(ctx);
-
-    // 3. Trees (strom_1 / strom_2)
-    this.terrain.renderTrees(ctx, renderer);
-
-    // 4. Tanks, barrels, parachutes, shields
-    for (const tank of this.tanks) {
-      tank.render(ctx, renderer);
-    }
-
-    // 5. Turn indicator arrow (`blk`, Sprite 225)
-    if (this.blik) {
-      ctx.save();
-      ctx.translate(this.blik.x, this.blik.y);
-      renderer.drawSprite(ctx, 'blk', { frame: Math.min(34, this.blik.frame) });
-      ctx.restore();
-    }
-
-    // 5b. Pending Air Strike target flares (pulsing red danger zone)
+  _renderBattleEntities(ctx) {
+    // 1. Pending Air Strike target flares (behind tanks/projectiles)
     if (this.pendingStrikes.length) {
       for (const s of this.pendingStrikes) {
         const pulse = 0.5 + 0.5 * Math.sin(((s.pulse || 0) / 30) * Math.PI * 2);
         const groundY = Math.min(STAGE_H - 12, this.terrain.topY(s.targetX));
         ctx.save();
-        // Translucent vertical laser danger zone
-        ctx.fillStyle = `rgba(255, 50, 50, ${0.12 + pulse * 0.16})`;
-        ctx.fillRect(s.targetX - 42, 54, 84, STAGE_H - 54);
-        // Dashed laser border lines
-        ctx.strokeStyle = `rgba(255, 85, 85, ${0.45 + pulse * 0.45})`;
-        ctx.lineWidth = 1.2;
-        ctx.setLineDash([4, 3]);
+        ctx.fillStyle = `rgba(239, 68, 68, ${(0.09 + pulse * 0.12).toFixed(3)})`;
+        ctx.fillRect(s.targetX - 42, -120, 84, STAGE_H + 140);
+
+        ctx.strokeStyle = `rgba(220, 38, 38, ${(0.45 + pulse * 0.4).toFixed(3)})`;
+        ctx.lineWidth = 1.1;
+        ctx.setLineDash([4, 4]);
         ctx.beginPath();
-        ctx.moveTo(s.targetX - 42, 54);
+        ctx.moveTo(s.targetX - 42, -120);
         ctx.lineTo(s.targetX - 42, STAGE_H);
-        ctx.moveTo(s.targetX + 42, 54);
+        ctx.moveTo(s.targetX + 42, -120);
         ctx.lineTo(s.targetX + 42, STAGE_H);
         ctx.stroke();
         ctx.setLineDash([]);
-        // Ground flare beacon
+
+        // Pulsing flare ring on ground
         ctx.beginPath();
-        ctx.arc(s.targetX, groundY - 3, 4 + pulse * 3, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(255, 60, 40, ${0.65 + pulse * 0.35})`;
+        ctx.arc(s.targetX, groundY - 2, 4 + pulse * 4, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(239, 68, 68, ${(0.8 - pulse * 0.4).toFixed(3)})`;
+        ctx.lineWidth = 1.4;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(s.targetX, groundY - 2, 2.6, 0, Math.PI * 2);
+        ctx.fillStyle = '#ef4444';
         ctx.fill();
-        // Warning label
-        ctx.fillStyle = 'rgba(0,0,0,0.72)';
-        ctx.fillRect(s.targetX - 40, Math.max(60, groundY - 26), 80, 14);
-        ctx.fillStyle = '#ff7b7b';
-        ctx.font = 'bold 8.5px Arial, sans-serif';
+
+        // Crisp pill badge
+        const badgeY = Math.max(40, groundY - 26);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(s.targetX - 38, badgeY - 7, 76, 14, 7);
+        else ctx.rect(s.targetX - 38, badgeY - 7, 76, 14);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = '#dc2626';
+        ctx.font = '800 7.5px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText('! AIR STRIKE !', s.targetX, Math.max(67, groundY - 19));
+        ctx.fillText('AIR STRIKE', s.targetX, badgeY + 0.3);
         ctx.restore();
       }
     }
 
-    // 6. Projectiles & Explosions
+    // 2. Tanks, double-ring shields, parachutes & overhead micro HP/nameplates
+    for (const tank of this.tanks) {
+      tank.render(ctx, this);
+    }
+
+    // 3. Clean Paper-Cut turn-start bouncing chevron above active tank
+    if (this.blik) {
+      const f = this.blik.frame;
+      const alpha = f > 22 ? Math.max(0, 1 - (f - 22) / 13) : 1;
+      const bounce = Math.sin(f * 0.38) * 3.5;
+      const cy = this.blik.y - 34 + bounce;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(this.blik.x, cy);
+      ctx.fillStyle = this.blik.col || '#0284c7';
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(0, 5);
+      ctx.lineTo(-5.5, -3);
+      ctx.lineTo(5.5, -3);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 4. Projectiles
     for (const proj of this.projectiles) {
-      proj.render(ctx, renderer);
+      proj.render(ctx);
     }
 
-    // 7. Teleport animation / cursor
+    // 5. Shockwave rings, smoke trails, sparks & floating damage/bounty popups
+    this.vfx.renderBattleFx(ctx);
+
+    // 6. Teleport reticle / shimmer beam
     if (this.teleport) {
-      this.teleport.render(ctx, renderer);
+      this.teleport.render(ctx);
     }
 
-    // 8. HUD Panel (`panel`, Sprite 222 at (442.6, 28.4))
-    this._renderPanel(ctx);
-
-    // 9. Air Strike cursor (above panel, depth 1100000)
+    // 7. Air Strike targeting overlay
     if (this.airStrike) {
-      this.airStrike.render(ctx, renderer);
+      this.airStrike.render(ctx);
     }
-  }
-
-  _renderPanel(ctx) {
-    const renderer = this.renderer;
-    const t = this.activeTank || this.nextTank || this.tanks[0];
-    if (!t) return;
-    const pd = t.data;
-    const isHumanCtrl = this.canLocalControl();
-    const curWeapon = WEAPONS[pd.cur_gun] || WEAPONS[0];
-    const gunCount = pd.guns[pd.cur_gun] ?? 0;
-
-    // Compute sorted scoreboard order (descending by total_score, deterministic tie-break)
-    const ranked = [...this.playerData].sort((a, b) => b.total_score - a.total_score || a.t_num - b.t_num);
-    const scoreYs = [28.3, 42.45, 56.6, 70.75, 84.9];
-
-    ctx.save();
-    ctx.translate(PANEL_X, PANEL_Y);
-
-    // Determine specials frame states matching panel child refresh() methods
-    const repairFrame = (isHumanCtrl && pd.energy < pd.max_energy && pd.specials[1] > 0) ? 0 : 1;
-    const parFrame = (!isHumanCtrl || pd.specials[0] <= 0) ? 2 : (t.par ? 1 : 0);
-    const telFrame = (isHumanCtrl && pd.specials[7] > 0) ? 0 : 1;
-    const shFrame = !isHumanCtrl ? 2 : (this.shieldsMenuOpen ? 1 : 0);
-
-    const hudBtnStates = this.hoverHudButton
-      ? { [this.hoverHudButton]: this.mouseDown ? 'down' : 'over' }
-      : null;
-
-    renderer.drawSprite(ctx, 'panel', {
-      frame: 0,
-      buttonStates: hudBtnStates,
-      vars: {
-        power: String(Math.round(t.power)),
-        rotation: String(Math.round(t.rotace)),
-        energy: String(Math.round(pd.energy)),
-        fuel: String(Math.round(pd.fuel)),
-        score: String(Math.round(pd.score)),
-        vitr: String(Math.abs(Math.round(this.terrain.vitr))),
-      },
-      overrides: {
-        name: {
-          cx: rgbToCx(pd.col),
-          vars: { name: pd.name },
-        },
-        vitr_uk: {
-          xscale: this.terrain.vitr / 100,
-          yscale: 0.83134,
-        },
-        ico: {
-          vars: {
-            name: curWeapon.name,
-            count: String(gunCount),
-          },
-          afterDraw: (c, renderer) => {
-            c.save();
-            c.translate(-55, 0);
-            renderer.drawSprite(c, curWeapon.icon);
-            c.restore();
-          },
-        },
-        pow: {
-          overrides: {
-            pow: { y: 100 - t.power },
-            shadow: { y: -getMaxPower(pd.energy) },
-          },
-        },
-        '#145': {
-          overrides: {
-            drag: { x: -90 + t.rotace },
-          },
-        },
-        fuel_ar: {
-          frame: this.shieldsMenuOpen ? 1 : 0,
-        },
-        tank: {
-          overrides: {
-            hlaven: {
-              x: -0.05,
-              y: -0.75,
-              rotation: t.rotace,
-              xscale: 1,
-              yscale: 1,
-            },
-          },
-        },
-        rad1: { frame: this.quality === 'HIGH' ? 1 : 0 },
-        rad2: { frame: this.quality === 'MEDIUM' ? 1 : 0 },
-        rad3: { frame: this.quality === 'LOW' ? 1 : 0 },
-        repair: {
-          frame: repairFrame,
-          vars: { count: String(pd.specials[1]) },
-        },
-        parachutes: {
-          frame: parFrame,
-          vars: { count: String(pd.specials[0]) },
-        },
-        teleport: {
-          frame: telFrame,
-          vars: { count: String(pd.specials[7]) },
-        },
-        shields: {
-          frame: shFrame,
-          overrides: {
-            sh1: {
-              frame: (pd.specials[3] > 0 && !t.shActive && !t.shieldUsedThisRound) ? (this.hoverShieldTier === 1 ? 1 : 0) : 2,
-              vars: { count: String(pd.specials[3]) },
-            },
-            sh2: {
-              frame: (pd.specials[4] > 0 && !t.shActive && !t.shieldUsedThisRound) ? (this.hoverShieldTier === 2 ? 1 : 0) : 2,
-              vars: { count: String(pd.specials[4]) },
-            },
-            sh3: {
-              frame: (pd.specials[5] > 0 && !t.shActive && !t.shieldUsedThisRound) ? (this.hoverShieldTier === 3 ? 1 : 0) : 2,
-              vars: { count: String(pd.specials[5]) },
-            },
-            sh4: {
-              frame: (pd.specials[6] > 0 && !t.shActive && !t.shieldUsedThisRound) ? (this.hoverShieldTier === 4 ? 1 : 0) : 2,
-              vars: { count: String(pd.specials[6]) },
-            },
-            sh_d: {
-              frame: t.shActive ? 0 : 1,
-            },
-          },
-        },
-      },
-    });
-
-    // Render sorted score_tab list on right side of screen (x=36, y=28.3..84.9)
-    for (let i = 0; i < ranked.length; i++) {
-      const p = ranked[i];
-      ctx.save();
-      ctx.translate(36, scoreYs[i]);
-      renderer.drawSprite(ctx, 'score_tab', {
-        cx: rgbToCx(p.col),
-        vars: {
-          name: p.name,
-          score: String(Math.round(p.total_score)),
-        },
-      });
-      ctx.restore();
-    }
-
-    ctx.restore();
-
-    // Subtle battle status banners (Sudden Death, 4x Bot Skip, Turn Timer, Online Wait, Event Toast)
-    let bannerY = 53;
-    const dmgMult = this.getDamageMultiplier();
-    if (dmgMult > 1) {
-      ctx.save();
-      ctx.fillStyle = 'rgba(130, 20, 10, 0.82)';
-      ctx.fillRect(8, bannerY, 138, 16);
-      ctx.strokeStyle = '#ff7b54';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(8, bannerY, 138, 16);
-      ctx.fillStyle = '#ffe0b2';
-      ctx.font = 'bold 9px Arial, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(`SUDDEN DEATH · ${dmgMult.toFixed(1)}x DMG`, 77, bannerY + 8);
-      ctx.restore();
-    }
-
-    if (this.fastForward && this.isBotsOnlyAlive()) {
-      const ffY = dmgMult > 1 ? bannerY + 19 : bannerY;
-      ctx.save();
-      ctx.fillStyle = 'rgba(38, 87, 168, 0.88)';
-      ctx.fillRect(8, ffY, 114, 16);
-      ctx.strokeStyle = '#7db0ff';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(8, ffY, 114, 16);
-      ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 9px Arial, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('>> 4x BOT BATTLE', 65, ffY + 8);
-      ctx.restore();
-    }
-
-    if (this.turnTimerSec > 0 && this.activeTank && this.activeTank.type === 'tank' && this.activeTank.playing) {
-      const secs = Math.max(0, Math.ceil(this.turnTicksLeft / FPS));
-      const urgent = secs <= 5;
-      ctx.save();
-      ctx.fillStyle = urgent ? 'rgba(180, 24, 24, 0.86)' : 'rgba(0, 0, 0, 0.65)';
-      ctx.fillRect(390, 53, 56, 17);
-      ctx.fillStyle = urgent ? '#ffd54f' : '#e2ecff';
-      ctx.font = 'bold 10px Arial, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(`⏱ ${secs}s`, 418, 61.5);
-      ctx.restore();
-    }
-
-    if (this.mode === 'online' && this.activeTank && this.activeTank.playing) {
-      const isMine = this.activeTank.type === 'tank' && this.activeTank.tankNumber === this.mySlot;
-      if (!isMine) {
-        ctx.save();
-        ctx.fillStyle = 'rgba(0,0,0,0.58)';
-        ctx.fillRect(175, bannerY, 200, 18);
-        ctx.fillStyle = '#ffe680';
-        ctx.font = 'bold 10px Arial, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(`Waiting for ${pd.name}...`, 275, bannerY + 9);
-        ctx.restore();
-        bannerY += 20;
-      }
-    }
-
-    if (this.bannerToast) {
-      ctx.save();
-      ctx.font = 'bold 10px Arial, sans-serif';
-      const w = Math.min(360, Math.max(180, ctx.measureText(this.bannerToast.text).width + 24));
-      ctx.fillStyle = 'rgba(10, 14, 24, 0.78)';
-      ctx.fillRect(275 - w / 2, bannerY, w, 18);
-      ctx.strokeStyle = this.bannerToast.color;
-      ctx.lineWidth = 1;
-      ctx.strokeRect(275 - w / 2, bannerY, w, 18);
-      ctx.fillStyle = this.bannerToast.color;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(this.bannerToast.text, 275, bannerY + 9);
-      ctx.restore();
-    }
-  }
-
-  _renderClona(ctx) {
-    const renderer = this.renderer;
-    const c = this.clona;
-    const showShop = this.scene === 'shop' && c.purchasing && this.shopCur >= 1 && this.shopCur <= this.playerCount;
-    const pd = showShop ? this.playerData[this.shopCur - 1] : null;
-
-    ctx.save();
-    ctx.translate(275, 200);
-
-    // Draw left & right metallic blast doors (`l` cid=232, `r` cid=239)
-    ctx.save();
-    ctx.translate(c.lx, 0);
-    renderer.drawSprite(ctx, 232);
-    ctx.restore();
-
-    ctx.save();
-    ctx.translate(c.rx, 0);
-    renderer.drawSprite(ctx, 239);
-    ctx.restore();
-
-    if (showShop && pd) {
-      // Score & Player header
-      ctx.save();
-      ctx.translate(-152.5, -188.1);
-      renderer.drawSprite(ctx, 234, { vars: { score: String(Math.round(pd.score)) } });
-      ctx.restore();
-
-      ctx.save();
-      ctx.translate(-139.0, -171.0);
-      renderer.drawSprite(ctx, 236, {
-        cx: rgbToCx(pd.col),
-        vars: { player: pd.name },
-      });
-      ctx.restore();
-
-      // Weapons list (left column x = -140, y = -140 + 18.1*i)
-      for (let i = 0; i < WEAPONS.length; i++) {
-        const w = WEAPONS[i];
-        const afford = pd.score >= w.price;
-        const ry = -140 + 18.1 * i;
-        ctx.save();
-        ctx.translate(-140, ry);
-        renderer.drawSprite(ctx, 'weapon', {
-          vars: {
-            w_caption: afford ? w.name : '',
-            w2_caption: afford ? '' : w.name,
-            w_price: String(w.price),
-            w_count: String(w.pack),
-            t_count: String(pd.guns[i]),
-          },
-        });
-        ctx.save();
-        ctx.translate(-74, 0.4);
-        renderer.drawSprite(ctx, w.icon);
-        ctx.restore();
-        ctx.restore();
-      }
-
-      // Specials list (right column x = +140, y = -140 + 17.7*i)
-      for (let i = 0; i < SPECIALS.length; i++) {
-        const s = SPECIALS[i];
-        const maxed = Boolean(s.maxLevel && pd.specials[i] >= s.maxLevel);
-        const afford = !maxed && pd.score >= s.price;
-        const countLabel = s.maxLevel
-          ? (maxed ? 'MAX' : `${pd.specials[i]}/${s.maxLevel}`)
-          : String(pd.specials[i]);
-        const ry = -140 + 17.7 * i;
-        ctx.save();
-        ctx.translate(140, ry);
-        renderer.drawSprite(ctx, 'special', {
-          vars: {
-            w_caption: afford ? s.name : '',
-            w2_caption: afford ? '' : s.name,
-            w_price: maxed ? 'MAX' : String(s.price),
-            w_count: String(s.pack),
-            t_count: countLabel,
-          },
-        });
-        ctx.save();
-        ctx.translate(-74, 0.4);
-        renderer.drawSprite(ctx, s.icon);
-        ctx.restore();
-        ctx.restore();
-      }
-
-      // Next player / Start! / Ready! button (`buymenu` at (+140, +80))
-      const overBtn = this._inBox(this.mouseX - 275, this.mouseY - 200, 85, 65, 195, 97);
-      ctx.save();
-      ctx.translate(140, 80);
-      renderer.drawSprite(ctx, 'buymenu', {
-        vars: { but_capt: this._shopButtonCaption() },
-        buttonStates: { 242: overBtn ? (this.mouseDown ? 'down' : 'over') : 'up' },
-      });
-      ctx.restore();
-    }
-
-    ctx.restore();
   }
 
   _notifyStatus() {

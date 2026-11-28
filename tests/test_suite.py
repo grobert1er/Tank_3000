@@ -65,7 +65,7 @@ def test_assets():
 def test_js_module_links():
     print("[2/3] Checking JS ES module imports & exports...")
     js_files = sorted((ROOT / "js").glob("*.js"))
-    assert len(js_files) == 11, f"Expected 11 JS modules, got {len(js_files)}"
+    assert len(js_files) == 12, f"Expected 12 JS modules, got {len(js_files)}"
     for jf in js_files:
         txt = jf.read_text(encoding="utf-8")
         for m in re.finditer(r"import\s+\{([^}]+)\}\s+from\s+'(\./[^']+)'", txt):

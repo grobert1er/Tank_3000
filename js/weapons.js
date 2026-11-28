@@ -26,6 +26,9 @@ export class Projectile {
     this.y0 = opts.y;
     this.x = opts.x;
     this.y = opts.y;
+    this.prevX = opts.x;
+    this.prevY = opts.y;
+    this.angleRad = 0;
     this.parentRot = opts.parentRot ?? 0; // rotace - 90
     this.uhel = opts.uhel !== undefined ? opts.uhel : (-this.parentRot + 90);
     this.vo = opts.vo ?? 50;
@@ -69,6 +72,7 @@ export class Projectile {
     this.first = false;
     this.second = false;
     this.frame = 2;
+    game.vfx?.spawnExplosion(this.x, this.y, this.spec.f6w, this.spec.kind || 'missile');
     game.sound.play(this.spec.soundId, { volume: 0.9, minIntervalMs: 30 });
   }
 
@@ -246,13 +250,30 @@ export class Projectile {
     }
 
     if (this.isRoller) {
+      this.prevX = this.x;
+      this.prevY = this.y;
       this._tickRoller(game);
+      if (this.first) {
+        game.vfx?.spawnTrail(this.x, this.y, this.spec.f6w >= 90, 'rgba(255,255,255,0.62)');
+      }
       return;
     }
 
     // Standard / cluster / air-strike ballistic motion
+    this.prevX = this.x;
+    this.prevY = this.y;
     this.x = this.x0 + this.vox * this.t;
     this.y = this.y0 - this.voy * this.t + (this.g / 2) * (this.t * this.t);
+    const dx = this.x - this.prevX;
+    const dy = this.y - this.prevY;
+    if (dx * dx + dy * dy > 0.01) {
+      this.angleRad = Math.atan2(dy, dx);
+    }
+    const isHeavy = this.spec.f6w >= 90;
+    const trailCol = this.spec.kind === 'death' || this.spec.kind === 'funky'
+      ? 'rgba(251, 146, 60, 0.55)'
+      : 'rgba(255, 255, 255, 0.68)';
+    game.vfx?.spawnTrail(this.x, this.y, isHeavy, trailCol);
     if (!this.noWind) {
       this.vox += game.terrain.vitr / 600;
     }
@@ -360,16 +381,59 @@ export class Projectile {
     }
   }
 
-  render(ctx, renderer) {
-    if (this.done || this.waitingForSubs) return;
+  // Clean Paper-Cut projectile silhouette (explosions rendered by game.vfx)
+  render(ctx) {
+    if (this.done || this.waitingForSubs || this.exploding) return;
     ctx.save();
     ctx.translate(this.x, this.y);
-    if (!this.exploding) {
-      ctx.rotate((this.parentRot * Math.PI) / 180);
-      renderer.drawSprite(ctx, this.spec.spriteId, { frame: 0 });
-    } else {
-      renderer.drawSprite(ctx, this.spec.spriteId, { frame: Math.min(11, this.frame - 1) });
+
+    if (this.isRoller) {
+      const r = this.spec.f6w >= 150 ? 4.2 : this.spec.f6w >= 85 ? 3.3 : 2.5;
+      ctx.fillStyle = this.uphill ? '#0284c7' : '#334155';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 0.9;
+      ctx.beginPath();
+      ctx.arc(0, -r * 0.4, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      // Rotating highlight dot
+      const spin = (this.x * 0.25) % (Math.PI * 2);
+      ctx.fillStyle = this.uphill ? '#bae6fd' : '#f97316';
+      ctx.beginPath();
+      ctx.arc(Math.cos(spin) * r * 0.45, -r * 0.4 + Math.sin(spin) * r * 0.45, r * 0.32, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      return;
     }
+
+    ctx.rotate(this.angleRad);
+    const isNuke = this.spec.f6w >= 150;
+    const isHeavy = this.spec.f6w >= 85;
+    const len = isNuke ? 7.5 : isHeavy ? 5.8 : 4.4;
+    const rad = isNuke ? 2.6 : isHeavy ? 2.0 : 1.45;
+
+    // Warm thruster glow behind shell
+    ctx.fillStyle = 'rgba(249, 115, 22, 0.78)';
+    ctx.beginPath();
+    ctx.arc(-len * 0.55, 0, rad * 1.15, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Crisp Paper-Cut warhead body
+    ctx.fillStyle = isNuke ? '#1e293b' : this.spec.kind === 'funky' || this.spec.kind === 'death' ? '#dc2626' : '#0f172a';
+    ctx.beginPath();
+    ctx.moveTo(len * 0.65, 0);
+    ctx.lineTo(-len * 0.45, -rad);
+    ctx.lineTo(-len * 0.55, 0);
+    ctx.lineTo(-len * 0.45, rad);
+    ctx.closePath();
+    ctx.fill();
+
+    // Accent nose tip
+    ctx.fillStyle = isNuke ? '#facc15' : '#f97316';
+    ctx.beginPath();
+    ctx.arc(len * 0.42, 0, rad * 0.55, 0, Math.PI * 2);
+    ctx.fill();
+
     ctx.restore();
   }
 }
@@ -443,12 +507,38 @@ export class AirStrikeController {
     // Completes immediately upon planting flare; bombs drop via game.pendingStrikes
   }
 
-  render(ctx, renderer) {
+  render(ctx) {
     if (this.launched || this.done) return;
     ctx.save();
-    ctx.translate(this.cursorX, this.cursorY);
-    if (this.uhel === 180) ctx.scale(-1, 1);
-    renderer.drawSprite(ctx, 'astrikecur');
+    // Clean Paper-Cut vertical target preview band + directional plane indicator
+    ctx.fillStyle = 'rgba(239, 68, 68, 0.14)';
+    ctx.fillRect(this.cursorX - 42, 0, 84, STAGE_H);
+    ctx.strokeStyle = 'rgba(239, 68, 68, 0.72)';
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(this.cursorX - 42, 0);
+    ctx.lineTo(this.cursorX - 42, STAGE_H);
+    ctx.moveTo(this.cursorX + 42, 0);
+    ctx.lineTo(this.cursorX + 42, STAGE_H);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.translate(this.cursorX, Math.max(48, Math.min(STAGE_H - 40, this.cursorY)));
+    const dir = this.uhel === 180 ? -1 : 1;
+    ctx.scale(dir, 1);
+    ctx.fillStyle = '#0f172a';
+    ctx.beginPath();
+    ctx.moveTo(14, 0);
+    ctx.lineTo(-10, -5);
+    ctx.lineTo(-6, 0);
+    ctx.lineTo(-10, 5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#ef4444';
+    ctx.beginPath();
+    ctx.arc(0, 0, 2.2, 0, Math.PI * 2);
+    ctx.fill();
     ctx.restore();
   }
 }
@@ -501,15 +591,37 @@ export class TeleportController {
     }
   }
 
-  render(ctx, renderer) {
+  render(ctx) {
     if (this.done) return;
     ctx.save();
     if (!this.picked) {
+      // Clean Paper-Cut teleport destination reticle
       ctx.translate(this.cursorX, this.cursorY);
-      renderer.drawSprite(ctx, 'teleport_a', { frame: 0 });
+      ctx.strokeStyle = '#0284c7';
+      ctx.fillStyle = 'rgba(56, 189, 248, 0.16)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.arc(0, 0, 12, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(-16, 0); ctx.lineTo(-6, 0);
+      ctx.moveTo(6, 0); ctx.lineTo(16, 0);
+      ctx.moveTo(0, -16); ctx.lineTo(0, -6);
+      ctx.moveTo(0, 6); ctx.lineTo(0, 16);
+      ctx.stroke();
     } else {
+      // Expanding/contracting Paper-Cut teleport shimmer beam
       ctx.translate(this.x, this.y);
-      renderer.drawSprite(ctx, 'teleport_a', { frame: Math.min(47, this.frame - 1) });
+      const t = this.frame < 24 ? this.frame / 24 : (48 - this.frame) / 24;
+      const r = Math.max(2, 18 * Math.sin(Math.min(1, t) * Math.PI));
+      ctx.fillStyle = `rgba(56, 189, 248, ${(0.25 * t).toFixed(2)})`;
+      ctx.fillRect(-r * 0.7, -this.y, r * 1.4, this.y + 8);
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.stroke();
     }
     ctx.restore();
   }

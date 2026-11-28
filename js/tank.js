@@ -8,7 +8,26 @@ import {
   SHIELD_RADIUS, SHIELD_TIERS, SOUNDS,
   MAX_UPGRADE_LEVEL, LEADER_BOUNTY, getMaxPower,
 } from './constants.js';
-import { rgbToCx, alphaCx } from './renderer.js';
+
+function hexIntToRgb(hex) {
+  return [(hex >> 16) & 0xFF, (hex >> 8) & 0xFF, hex & 0xFF];
+}
+
+function rgbStr([r, g, b], a = 1) {
+  return a < 1 ? `rgba(${r},${g},${b},${a})` : `rgb(${r},${g},${b})`;
+}
+
+function tintRgb([r, g, b], delta) {
+  const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+  return [clamp(r + delta), clamp(g + delta), clamp(b + delta)];
+}
+
+const SHIELD_COLORS = {
+  1: { fill: 'rgba(56, 189, 248, 0.14)', stroke: '#38bdf8' },
+  2: { fill: 'rgba(14, 165, 233, 0.16)', stroke: '#0284c7' },
+  3: { fill: 'rgba(99, 102, 241, 0.16)', stroke: '#6366f1' },
+  4: { fill: 'rgba(139, 92, 246, 0.18)', stroke: '#8b5cf6' },
+};
 
 export class Tank {
   constructor(data, x, terrain, rng, flatten = true) {
@@ -172,14 +191,18 @@ export class Tank {
     const overflow = Math.max(0, rawDam - this.shieldEnergy);
     this.shieldEnergy -= absorbed;
 
-    if (absorbed > 0 && attacker && attacker !== this) {
-      const pts = Math.round(absorbed * 40);
-      attacker.data.score += pts;
-      attacker.data.total_score += pts;
+    if (absorbed > 0) {
+      game?.vfx?.spawnPopup(this.x, this.y - 12, `-${absorbed}`, '#0284c7');
+      if (attacker && attacker !== this) {
+        const pts = Math.round(absorbed * 40);
+        attacker.data.score += pts;
+        attacker.data.total_score += pts;
+      }
     }
 
     if (this.shieldEnergy <= 0) {
       this.disableShield();
+      game?.vfx?.spawnPopup(this.x, this.y - 22, 'SHIELD BREAK', '#0ea5e9');
       if (overflow > 0) {
         // Overflow is already scaled by Sudden Death multiplier; pass alreadyScaled=true
         this.damage(overflow, attacker, false, game, true);
@@ -216,6 +239,8 @@ export class Tank {
       this.data.energy = 0;
     }
 
+    game?.vfx?.spawnPopup(this.x, this.y - 2, `-${actualDmg}`, isFall ? '#f59e0b' : '#ef4444');
+
     if (attacker && attacker !== this) {
       const dmgPts = actualDmg * 100;
       attacker.data.score += dmgPts;
@@ -229,9 +254,10 @@ export class Tank {
         if (game?.isScoreLeader?.(this.tankNumber)) {
           attacker.data.score += LEADER_BOUNTY;
           attacker.data.total_score += LEADER_BOUNTY;
+          game.vfx?.spawnPopup(attacker.x, attacker.y - 16, `BOUNTY +$${LEADER_BOUNTY}`, '#d97706', true);
           game.showToast?.(
             `LEADER BOUNTY! ${attacker.data.name} +$${LEADER_BOUNTY}`,
-            '#ffd54f',
+            '#d97706',
             70
           );
         }
@@ -528,53 +554,173 @@ export class Tank {
     this.disableShield();
     this.testing = false;
     game.aliveCount = Math.max(0, game.aliveCount - 1);
+    game.vfx?.spawnExplosion(this.x, this.y, TANK_DEATH_EXPL_W, 'death');
     game.sound.play(SOUNDS.TANK_EXPLODE, { volume: 0.9, minIntervalMs: 50 });
   }
 
-  render(ctx, renderer) {
-    if (this.dead || !this.visible) return;
+  // Clean Paper-Cut tank renderer with soft shadow, double-ring shield, and overhead micro HP/nameplate
+  render(ctx, game = null) {
+    if (this.dead || !this.visible || this.dying) return;
 
-    if (this.dying) {
-      ctx.save();
-      ctx.translate(this.x, this.y);
-      renderer.drawSprite(ctx, 'tank', { frame: Math.min(14, Math.max(3, this.deathFrame - 1)) });
-      ctx.restore();
-      return;
-    }
+    const baseRgb = hexIntToRgb(this.data.col ?? 0x333333);
+    const bodyCol = rgbStr(baseRgb);
+    const turretCol = rgbStr(tintRgb(baseRgb, 28));
+    const darkCol = rgbStr(tintRgb(baseRgb, -40));
+    const isActive = Boolean(game && game.activeTank === this && this.playing);
 
-    // Parachute behind/above tank
-    if (this.parOut) {
-      ctx.save();
-      ctx.translate(this.x, this.y - 7.5);
-      renderer.drawSprite(ctx, 'parachute');
-      ctx.restore();
-    }
-
-    // Barrel (hlaven) rotated around (x, y - 1)
-    ctx.save();
-    ctx.translate(this.x, this.y - 1);
-    ctx.rotate((this.rotace * Math.PI) / 180);
-    renderer.drawSprite(ctx, 'hlaven', { frame: this.barrelFrame });
-    ctx.restore();
-
-    // Tank body with player color tint
     ctx.save();
     ctx.translate(this.x, this.y);
-    renderer.drawSprite(ctx, 'tank', {
-      frame: 0,
-      overrides: {
-        col: { cx: rgbToCx(this.data.col) },
-      },
-    });
-    ctx.restore();
 
-    // Active shield bubble
-    if (this.shActive && this.shieldSprite) {
-      const alpha = Math.max(0.08, Math.min(1, this.shieldEnergy / (this.shieldMax || 1)));
+    // 1. Parachute canopy above tank
+    if (this.parOut) {
       ctx.save();
-      ctx.translate(this.x, this.y);
-      renderer.drawSprite(ctx, this.shieldSprite, { cx: alphaCx(alpha) });
+      ctx.strokeStyle = 'rgba(30, 41, 59, 0.55)';
+      ctx.lineWidth = 0.7;
+      ctx.beginPath();
+      ctx.moveTo(-7, -14);
+      ctx.lineTo(-2, -3);
+      ctx.moveTo(7, -14);
+      ctx.lineTo(2, -3);
+      ctx.moveTo(0, -15);
+      ctx.lineTo(0, -3);
+      ctx.stroke();
+
+      ctx.fillStyle = '#f8fafc';
+      ctx.beginPath();
+      ctx.arc(0, -14, 8.5, Math.PI, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#f97316';
+      ctx.beginPath();
+      ctx.arc(0, -14, 8.5, Math.PI + 0.85, -0.85);
+      ctx.lineTo(0, -14);
+      ctx.closePath();
+      ctx.fill();
       ctx.restore();
     }
+
+    // 2. Soft elliptical contact shadow
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.18)';
+    ctx.beginPath();
+    ctx.ellipse(0, 3.8, 9.2, 1.8, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 3. Articulated barrel with crisp recoil kickback
+    const recoil = this.barrelPlaying ? Math.sin((this.barrelFrame / 15) * Math.PI) * 2.2 : 0;
+    const rad = (this.rotace * Math.PI) / 180;
+    ctx.save();
+    ctx.translate(0, -1.6);
+    ctx.rotate(rad);
+    ctx.strokeStyle = '#1e293b';
+    ctx.lineWidth = 2.0;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(-(10.2 - recoil), 0);
+    ctx.stroke();
+    ctx.restore();
+
+    // 4. Sleek Paper-Cut faceted tank hull & bright turret cap
+    ctx.fillStyle = bodyCol;
+    ctx.beginPath();
+    ctx.moveTo(-8.2, 1.0);
+    ctx.lineTo(-6.2, -3.2);
+    ctx.lineTo(6.2, -3.2);
+    ctx.lineTo(8.2, 1.0);
+    ctx.closePath();
+    ctx.fill();
+
+    // Subtle shaded bottom bevel
+    ctx.fillStyle = darkCol;
+    ctx.globalAlpha = 0.25;
+    ctx.fillRect(-7.8, 0.0, 15.6, 1.1);
+    ctx.globalAlpha = 1;
+
+    // Turret dome
+    ctx.fillStyle = turretCol;
+    ctx.beginPath();
+    ctx.moveTo(-3.8, -3.1);
+    ctx.lineTo(-2.5, -5.6);
+    ctx.lineTo(2.5, -5.6);
+    ctx.lineTo(3.8, -3.1);
+    ctx.closePath();
+    ctx.fill();
+
+    // Rounded dark-slate treads
+    ctx.fillStyle = '#334155';
+    ctx.beginPath();
+    ctx.roundRect(-7.6, 1.0, 15.2, 2.5, 1.25);
+    ctx.fill();
+
+    // 5. Double-ring Paper-Cut Shield dome
+    if (this.shActive) {
+      const sc = SHIELD_COLORS[this.shieldTier] || SHIELD_COLORS[1];
+      const pct = Math.max(0.15, Math.min(1, this.shieldEnergy / (this.shieldMax || 1)));
+      ctx.save();
+      ctx.globalAlpha = 0.35 + pct * 0.65;
+      ctx.fillStyle = sc.fill;
+      ctx.strokeStyle = sc.stroke;
+      ctx.lineWidth = 1.25;
+      ctx.beginPath();
+      ctx.arc(0, -1, SHIELD_RADIUS, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.52)';
+      ctx.lineWidth = 0.85;
+      ctx.setLineDash([3.5, 3.5]);
+      ctx.beginPath();
+      ctx.arc(0, -1, SHIELD_RADIUS - 2.8, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    // 6. Overhead micro HP/Shield bar & player nameplate
+    const barY = this.shActive ? -(SHIELD_RADIUS + 8) : -14.5;
+    const barW = 24;
+    const barH = 2.8;
+    const hpPct = Math.max(0, Math.min(1, this.data.energy / (this.data.max_energy || 100)));
+    const hpCol = hpPct > 0.5 ? '#22c55e' : hpPct > 0.25 ? '#f59e0b' : '#ef4444';
+
+    // Shield mini-bar above HP bar when active
+    if (this.shActive && this.shieldMax > 0) {
+      const shPct = Math.max(0, Math.min(1, this.shieldEnergy / this.shieldMax));
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.38)';
+      ctx.beginPath();
+      ctx.roundRect(-barW / 2, barY - 3.6, barW, 2.2, 1.1);
+      ctx.fill();
+      ctx.fillStyle = '#38bdf8';
+      ctx.beginPath();
+      ctx.roundRect(-barW / 2, barY - 3.6, barW * shPct, 2.2, 1.1);
+      ctx.fill();
+    }
+
+    // HP track & fill
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.42)';
+    ctx.beginPath();
+    ctx.roundRect(-barW / 2, barY, barW, barH, 1.4);
+    ctx.fill();
+    if (hpPct > 0) {
+      ctx.fillStyle = hpCol;
+      ctx.beginPath();
+      ctx.roundRect(-barW / 2, barY, Math.max(2, barW * hpPct), barH, 1.4);
+      ctx.fill();
+    }
+
+    // Player nameplate above bar
+    const nameY = this.shActive ? barY - 7.5 : barY - 4.2;
+    ctx.font = `${isActive ? '800' : '600'} 7px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.lineWidth = 2.2;
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.88)';
+    const label = isActive ? `▾ ${this.data.name}` : this.data.name;
+    ctx.strokeText(label, 0, nameY);
+    ctx.fillStyle = isActive ? '#0f172a' : '#334155';
+    ctx.fillText(label, 0, nameY);
+
+    ctx.restore();
   }
 }
